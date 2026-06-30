@@ -1,0 +1,331 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Client {
+  id          Int               @id @default(autoincrement())
+  nombre      String
+  apellido    String?
+  dni         String?
+  fechaNacimiento DateTime?
+  sexo        String?
+  domicilio   String?
+  localidad   String?
+  provincia   String?
+  codigoPostal String?
+  ingresosMensuales Float?
+  email       String?
+  telefonoFijo String?
+  telefonoCelular String?
+  observaciones String?       @db.Text
+  createdAt   DateTime          @default(now())
+  fechaSuscripcion DateTime     @default(now())
+  tipoContrato String           @default("PLAN")
+
+  plans       InstallmentPlan[]
+  payments    Payment[]
+  financing   Financing[]
+  balance     CustomerBalance?
+  audios      Audio[]
+  vehicle     Vehicle?
+  cashMovements CashMovement[]
+
+  @@map("clients")
+}
+
+model InstallmentPlan {
+  id                  Int           @id @default(autoincrement())
+  numeroSolicitud     String?       @unique
+  clientId            Int
+  totalCuotas         Int
+  montoCuotaBase      Float
+  fechaInicio         DateTime
+  estado              String        @default("ACTIVO")
+  observaciones       String?       @db.Text
+
+  // Configuración de cargos del plan
+  selladoMonto        Float         @default(0)
+  cuotasConSellado    Int           @default(2)    // primeras 2 cuotas incluyen sellado
+  administrativoPct   Float         @default(0)    // % sobre monto base (cuota 3+)
+  cuotaObjetivoRetiro Int           @default(0)    // cuota mínima para habilitar retiro
+  retiroPct           Float         @default(0)    // % sobre saldo restante al retirar
+
+  // Datos de retiro (se llenan al retirar)
+  vehicleId           Int?
+  fechaRetiro         DateTime?
+  montoRetiro         Float?
+  saldoAlRetiro       Float?
+
+  // Resolución del plan (flujo único "Resolver plan")
+  fechaResolucion     DateTime?
+  resultadoVehiculo   String?       // "NO_RETIRO" | "AUTO" | "MOTO"
+  resolucionDetalle   Json?         // snapshot de lo registrado en la resolución
+
+  // Datos del vehículo retirado (se cargan en la resolución)
+  vehiculoMarca       String?
+  vehiculoModelo      String?
+  vehiculoAnio        Int?
+  vehiculoPatente     String?
+  boletoCompraventa   String?       // path/URL de la imagen del boleto
+  contratoMutuo       String?       // path/URL del PDF del contrato de mutuo
+
+  // Etapa SALDO (post-resolución). El saldo se inicia aparte porque la entrega
+  // del auto puede diferir de la fecha de negociación.
+  saldoIniciado       Boolean       @default(false)
+  fechaEntregaAuto    DateTime?     // fecha real de entrega del vehículo
+  saldoTotalCuotas    Int?          // cantidad de cuotas del saldo
+  saldoMontoCuota     Float?        // monto de cada cuota del saldo
+
+  // Relaciones
+  client              Client        @relation(fields: [clientId], references: [id])
+  installments        Installment[]
+  saldoCuotas         SaldoCuota[]
+  vehicle             Vehicle?      @relation(fields: [vehicleId], references: [id])
+  financing           Financing?
+
+  @@map("installment_plans")
+}
+
+model Installment {
+  id                Int                @id @default(autoincrement())
+  planId            Int
+  numero            Int
+  fechaVencimiento  DateTime
+  monto             Float              // monto base (sin cambios)
+  cargos            Float              @default(0)  // suma de cargos adicionales (deprecated)
+  cargosDetalle     Json?              // { comision, gastoRetiro, administrativo, sellado, mora }
+  total             Float              // monto + cargos (calculado)
+  pagado            Float              @default(0)
+  estado            String             @default("PENDIENTE")
+
+  plan              InstallmentPlan    @relation(fields: [planId], references: [id])
+  allocations       PaymentAllocation[]
+  cashMovements     CashMovement[]
+
+  @@map("installments")
+}
+
+// Cuotas de la etapa SALDO (post-resolución). Estructura paralela a Installment
+// pero independiente: el saldo es otra instancia del cliente.
+model SaldoCuota {
+  id                Int                 @id @default(autoincrement())
+  planId            Int
+  clientId          Int
+  numero            Int
+  fechaVencimiento  DateTime
+  monto             Float
+  pagado            Float               @default(0)
+  estado            String              @default("PENDIENTE")  // PENDIENTE | PARCIAL | PAGADO
+  createdAt         DateTime            @default(now())
+
+  plan              InstallmentPlan     @relation(fields: [planId], references: [id])
+  allocations       PaymentAllocation[]
+
+  @@map("saldo_cuotas")
+}
+
+model Payment {
+  id            Int                @id @default(autoincrement())
+  clientId      Int
+  montoTotal    Float              // monto que paga el cliente
+  montoAplicado Float              // monto aplicado a deuda (total - admin)
+  montoAdmin    Float              @default(0)  // descuento administrativo
+  origen        String             @default("CUOTA")  // "CUOTA" | "SALDO"
+  fecha         DateTime           @default(now())
+
+  client        Client              @relation(fields: [clientId], references: [id])
+  allocations   PaymentAllocation[]
+  attachments   PaymentAttachment[]
+  cashMovements CashMovement[]
+
+  @@map("payments")
+}
+
+model PaymentAllocation {
+  id            Int         @id @default(autoincrement())
+  paymentId     Int
+  installmentId Int?        // nullable: una imputación va a una cuota O a una cuota de saldo
+  saldoCuotaId  Int?
+  monto         Float
+
+  payment       Payment      @relation(fields: [paymentId], references: [id])
+  installment   Installment? @relation(fields: [installmentId], references: [id])
+  saldoCuota    SaldoCuota?  @relation(fields: [saldoCuotaId], references: [id])
+
+  @@map("payment_allocations")
+}
+
+model Financing {
+  id              Int              @id @default(autoincrement())
+  planId          Int              @unique
+  clientId        Int
+  vehicleId       Int
+  saldoInicial    Float
+  tasaAnual       Float
+  fechaCreacion   DateTime         @default(now())
+  
+  // Datos del retiro
+  precioVehiculo  Float
+  montoRetiro     Float            // cargo por retiro
+  cuotasPagadas   Int              // cuotas pagadas antes del retiro
+  montoPagado     Float            // total pagado antes del retiro
+
+  plan            InstallmentPlan  @relation(fields: [planId], references: [id])
+  client          Client           @relation(fields: [clientId], references: [id])
+  vehicle         Vehicle          @relation(fields: [vehicleId], references: [id])
+
+  @@map("financing")
+}
+
+model CustomerBalance {
+  id        Int     @id @default(autoincrement())
+  clientId  Int     @unique
+  saldo     Float   @default(0)
+
+  client    Client  @relation(fields: [clientId], references: [id])
+
+  @@map("customer_balances")
+}
+
+model Audio {
+  id           Int      @id @default(autoincrement())
+  clientId     Int
+  filename     String
+  originalName String
+  mimeType     String
+  size         Int
+  uploadedBy   String?
+  createdAt    DateTime @default(now())
+
+  client       Client   @relation(fields: [clientId], references: [id])
+
+  @@map("audios")
+}
+
+model PaymentAttachment {
+  id           Int      @id @default(autoincrement())
+  paymentId    Int
+  filename     String
+  originalName String
+  mimeType     String
+  size         Int
+  uploadedBy   String?
+  createdAt    DateTime @default(now())
+
+  payment      Payment  @relation(fields: [paymentId], references: [id])
+
+  @@map("payment_attachments")
+}
+
+model Vehicle {
+  id         Int              @id @default(autoincrement())
+  clientId   Int?             @unique
+  dominio    String
+  patente    String
+  modelo     String
+  anio       Int
+  precio     Float            @default(0)
+  disponible Boolean          @default(true)
+  createdAt  DateTime         @default(now())
+
+  client     Client?          @relation(fields: [clientId], references: [id])
+  plans      InstallmentPlan[]
+  financings Financing[]
+
+  @@map("vehicles")
+}
+
+model Config {
+  id                     Int    @id @default(autoincrement())
+  tasaAnualDefault       Float  @default(0)
+  moraDiariaDefault      Float  @default(0)
+
+  // Nuevos campos para cargos adicionales
+  comisionPorcentaje     Float  @default(10)     // 10% (deprecated - usar commissionRules)
+  gastoAdminFijo         Float  @default(5)      // $5 fijos
+  selladoFijo            Float  @default(3)      // $3 fijos
+  gastoRetiroPorcentaje  Float  @default(5)      // 5% del precio final
+
+  // Reglas dinámicas de comisión por cuota
+  commissionRules        Json?  @default("[]")   // [{ cuota: 1, porcentaje: 100 }, { cuota: 2, porcentaje: 30 }]
+
+  // Si true, el sellado forma parte de la comisión. Si false, el sellado genera un ingreso independiente.
+  includeSealInCommission Boolean @default(false)
+
+  @@map("config")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  username     String   @unique
+  passwordHash String
+  email        String?  @unique
+  role         String   @default("USER")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  @@map("users")
+}
+
+// ============================================================
+// CAJA (Ingresos y Egresos) — única fuente de verdad
+// ============================================================
+
+model CashMovementCategory {
+  id            Int             @id @default(autoincrement())
+  name          String          @unique
+  type          String          // "INGRESO" | "EGRESO"
+  system        Boolean         @default(false) // las del sistema no se pueden eliminar
+  isManual      Boolean         @default(true)  // si puede crearse desde el alta manual
+  requiresClient Boolean        @default(false) // si el alta manual exige un cliente
+
+  movements CashMovement[]
+
+  @@map("cash_movement_categories")
+}
+
+model CashMovement {
+  id            Int      @id @default(autoincrement())
+  // El tipo (INGRESO|EGRESO) NO se almacena aquí: es la categoría la única
+  // fuente de verdad del tipo (category.type). Evita estados inconsistentes.
+  categoryId    Int
+  amount        Float
+  description   String?  @db.Text
+
+  // Origen del movimiento. Determina si es editable/eliminable:
+  // solo MANUAL puede modificarse. El resto lo genera el sistema.
+  //   MANUAL            - alta manual del operador
+  //   PAYMENT           - devengado al pagarse una cuota (cobro/comisión/sellado)
+  //   CAPITAL_DELIVERY  - entrega de capital (plan en negociación)
+  //   WITHDRAWAL        - gasto de retiro cobrado
+  //   SYSTEM            - cualquier otro proceso automático
+  origin        String   @default("MANUAL")
+
+  // Trazabilidad opcional al origen
+  paymentId     Int?
+  clientId      Int?
+  installmentId Int?
+
+  createdBy     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  category      CashMovementCategory @relation(fields: [categoryId], references: [id])
+  payment       Payment?             @relation(fields: [paymentId], references: [id])
+  client        Client?              @relation(fields: [clientId], references: [id])
+  installment   Installment?         @relation(fields: [installmentId], references: [id])
+
+  @@index([origin])
+  @@index([categoryId])
+  @@index([clientId])
+  @@index([createdAt])
+  @@map("cash_movements")
+}
