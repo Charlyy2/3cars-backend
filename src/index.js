@@ -32,6 +32,10 @@ app.use(cors({
     'https://3cars.com.ar',
     'https://www.3cars.com.ar',
 
+    // Backoffice
+    'https://bo.3cars.com.ar',
+    'https://3cars-backoffice.pages.dev',
+
     // Desarrollo
     'http://localhost:4200',
     'http://localhost:8080'
