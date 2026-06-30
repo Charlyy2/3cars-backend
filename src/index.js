@@ -28,7 +28,14 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:4200', 'http://localhost:8080'], // Puertos comunes de Angular
+  origin: [
+    'https://3cars.com.ar',
+    'https://www.3cars.com.ar',
+
+    // Desarrollo
+    'http://localhost:4200',
+    'http://localhost:8080'
+  ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
