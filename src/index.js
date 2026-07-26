@@ -20,7 +20,7 @@ const cobranzasRoutes = require('./routes/cobranzasRoutes');
 const authRoutes = require('./routes/authRoutes');
 const fileRoutes = require('./routes/fileRoutes');
 const cashMovementRoutes = require('./routes/cashMovementRoutes');
-const { authenticateToken } = require('./middleware/authMiddleware');
+const { authenticateToken, blockViewerWrites } = require('./middleware/authMiddleware');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -48,23 +48,23 @@ app.use(express.json());
 
 // Routes
 app.use('/auth', authRoutes);
-app.use('/clients', authenticateToken, clientRoutes);
-app.use('/clients', authenticateToken, clientStatusRoutes);
-app.use('/clients', authenticateToken, customerBalanceRoutes);
-app.use('/installments', authenticateToken, installmentRoutes);
-app.use('/payments', authenticateToken, paymentRoutes);
-app.use('/financing', authenticateToken, financingRoutes);
-app.use('/cobranzas', authenticateToken, collectionRoutes);
-app.use('/sales', authenticateToken, salesRoutes);
-app.use('/operations', authenticateToken, operationsRoutes);
-app.use('/audios', authenticateToken, audioRoutes);
-app.use('/config', authenticateToken, configRoutes);
-app.use('/vehicles', authenticateToken, vehicleRoutes);
-app.use('/plans', authenticateToken, planRoutes);
-app.use('/cobranzas-op', authenticateToken, cobranzasRoutes);
-app.use('/files', authenticateToken, fileRoutes);
-app.use('/cash-movements', authenticateToken, cashMovementRoutes);
-app.use('/', authenticateToken, metricsRoutes);
+app.use('/clients', authenticateToken, blockViewerWrites, clientRoutes);
+app.use('/clients', authenticateToken, blockViewerWrites, clientStatusRoutes);
+app.use('/clients', authenticateToken, blockViewerWrites, customerBalanceRoutes);
+app.use('/installments', authenticateToken, blockViewerWrites, installmentRoutes);
+app.use('/payments', authenticateToken, blockViewerWrites, paymentRoutes);
+app.use('/financing', authenticateToken, blockViewerWrites, financingRoutes);
+app.use('/cobranzas', authenticateToken, blockViewerWrites, collectionRoutes);
+app.use('/sales', authenticateToken, blockViewerWrites, salesRoutes);
+app.use('/operations', authenticateToken, blockViewerWrites, operationsRoutes);
+app.use('/audios', authenticateToken, blockViewerWrites, audioRoutes);
+app.use('/config', authenticateToken, blockViewerWrites, configRoutes);
+app.use('/vehicles', authenticateToken, blockViewerWrites, vehicleRoutes);
+app.use('/plans', authenticateToken, blockViewerWrites, planRoutes);
+app.use('/cobranzas-op', authenticateToken, blockViewerWrites, cobranzasRoutes);
+app.use('/files', authenticateToken, blockViewerWrites, fileRoutes);
+app.use('/cash-movements', authenticateToken, blockViewerWrites, cashMovementRoutes);
+app.use('/', authenticateToken, blockViewerWrites, metricsRoutes);
 
 // Health check
 app.get('/', (req, res) => {

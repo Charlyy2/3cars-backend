@@ -54,6 +54,7 @@ async function seedExtraUsers() {
   const users = [
     { username: 'lautaro.ferin', email: 'lautaro.ferin@gmail.com', role: 'USER' },
     { username: 'supervisor', email: 'supervisor@gmail.com', role: 'USER' },
+    { username: 'viewer', email: 'viewer@gmail.com', role: 'VIEWER' },
   ];
 
   const hashedPassword = await bcrypt.hash('12345', 10);

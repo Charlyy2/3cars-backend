@@ -23,6 +23,24 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// Rol de solo lectura: puede ver todo pero no modificar nada.
+const READONLY_ROLE = 'VIEWER';
+
+// Bloquea cualquier método que no sea GET para usuarios VIEWER.
+// Se aplica DESPUÉS de authenticateToken (necesita req.user).
+// Devuelve un `code` propio para que el front lo distinga del 403 de token inválido.
+const blockViewerWrites = (req, res, next) => {
+  if (req.user && req.user.role === READONLY_ROLE && req.method !== 'GET') {
+    return res.status(403).json({
+      error: 'Tu usuario es de solo lectura y no puede realizar esta acción',
+      code: 'READ_ONLY',
+    });
+  }
+  next();
+};
+
 module.exports = {
-  authenticateToken
+  authenticateToken,
+  blockViewerWrites,
+  READONLY_ROLE,
 };
