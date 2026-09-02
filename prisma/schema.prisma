@@ -246,7 +246,13 @@ model Vehicle {
 model Config {
   id                     Int    @id @default(autoincrement())
   tasaAnualDefault       Float  @default(0)
-  moraDiariaDefault      Float  @default(0)
+  moraDiariaDefault      Float  @default(0)   // deprecated: reemplazado por moraDiariaPlan/Negociacion (se mantiene como alias de compatibilidad)
+
+  // Mora diaria separada por tipo de deuda:
+  //  - moraDiariaPlan: cuotas del plan (etapa ACTIVO)
+  //  - moraDiariaNegociacion: cuotas de saldo (etapa post-negociación)
+  moraDiariaPlan         Float  @default(0)
+  moraDiariaNegociacion  Float  @default(0)
 
   // Nuevos campos para cargos adicionales
   comisionPorcentaje     Float  @default(10)     // 10% (deprecated - usar commissionRules)

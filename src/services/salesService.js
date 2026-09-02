@@ -187,7 +187,7 @@ const getSaleByClientId = async (clientId) => {
     // Obtener el financing más reciente del cliente
     const financing = await prisma.financing.findFirst({
       where: { clientId: clientId },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { fechaCreacion: 'desc' },
       include: {
         client: {
           select: {
@@ -204,10 +204,14 @@ const getSaleByClientId = async (clientId) => {
         financing: {
           id: financing.id,
           clientId: financing.clientId,
-          precioTotal: financing.precioTotal,
-          entregaInicial: financing.entregaInicial,
-          saldo: financing.saldo,
-          createdAt: financing.createdAt,
+          vehicleId: financing.vehicleId,
+          saldoInicial: financing.saldoInicial,
+          tasaAnual: financing.tasaAnual,
+          precioVehiculo: financing.precioVehiculo,
+          montoRetiro: financing.montoRetiro,
+          cuotasPagadas: financing.cuotasPagadas,
+          montoPagado: financing.montoPagado,
+          fechaCreacion: financing.fechaCreacion,
           client: financing.client,
         },
       };

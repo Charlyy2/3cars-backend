@@ -53,8 +53,9 @@ const getFinancingByClientId = async (clientId) => {
     totalOverdueDays += overdueDays;
   }
 
-  // Calcular interés acumulado por mora diaria configurable
-  const moraDiaria = config.moraDiariaDefault;
+  // Calcular interés acumulado por mora diaria configurable.
+  // La financiación es del plan → tasa de PLANES.
+  const moraDiaria = config.moraDiariaPlan;
   const accumulatedInterest = financing.saldo * (moraDiaria / 100) * totalOverdueDays;
 
   // Calcular deuda total

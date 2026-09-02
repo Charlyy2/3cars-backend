@@ -12,9 +12,11 @@ const getConfig = async (req, res) => {
 
 const updateConfig = async (req, res) => {
   try {
-    const { 
-      tasaAnualDefault, 
+    const {
+      tasaAnualDefault,
       moraDiariaDefault,
+      moraDiariaPlan,
+      moraDiariaNegociacion,
       comisionPorcentaje,
       gastoAdminFijo,
       selladoFijo,
@@ -23,34 +25,42 @@ const updateConfig = async (req, res) => {
       includeSealInCommission
     } = req.body;
 
-    if (tasaAnualDefault === undefined || moraDiariaDefault === undefined) {
+    // Compatibilidad: si no llegan las tasas nuevas, usar la única anterior.
+    const rawPlan = moraDiariaPlan !== undefined ? moraDiariaPlan : moraDiariaDefault;
+    const rawNeg = moraDiariaNegociacion !== undefined ? moraDiariaNegociacion : moraDiariaDefault;
+
+    if (tasaAnualDefault === undefined || rawPlan === undefined || rawNeg === undefined) {
       return res.status(400).json({
-        error: 'tasaAnualDefault y moraDiariaDefault son requeridos',
+        error: 'tasaAnualDefault, moraDiariaPlan y moraDiariaNegociacion son requeridos',
       });
     }
 
     const parsedTasa = Number(tasaAnualDefault);
-    const parsedMora = Number(moraDiariaDefault);
+    const parsedMoraPlan = Number(rawPlan);
+    const parsedMoraNeg = Number(rawNeg);
     const parsedComision = Number(comisionPorcentaje) || 10;
     const parsedGastoAdmin = Number(gastoAdminFijo) || 5;
     const parsedSellado = Number(selladoFijo) || 3;
     const parsedGastoRetiro = Number(gastoRetiroPorcentaje) || 5;
 
-    if (Number.isNaN(parsedTasa) || Number.isNaN(parsedMora)) {
+    if (Number.isNaN(parsedTasa) || Number.isNaN(parsedMoraPlan) || Number.isNaN(parsedMoraNeg)) {
       return res.status(400).json({
-        error: 'tasaAnualDefault y moraDiariaDefault deben ser numéricos',
+        error: 'tasaAnualDefault, moraDiariaPlan y moraDiariaNegociacion deben ser numéricos',
       });
     }
 
-    if (parsedTasa < 0 || parsedMora < 0) {
+    if (parsedTasa < 0 || parsedMoraPlan < 0 || parsedMoraNeg < 0) {
       return res.status(400).json({
-        error: 'tasaAnualDefault y moraDiariaDefault deben ser mayores o iguales a 0',
+        error: 'tasaAnualDefault, moraDiariaPlan y moraDiariaNegociacion deben ser mayores o iguales a 0',
       });
     }
 
     const updateData = {
       tasaAnualDefault: parsedTasa,
-      moraDiariaDefault: parsedMora,
+      // Alias legacy = tasa de plan.
+      moraDiariaDefault: parsedMoraPlan,
+      moraDiariaPlan: parsedMoraPlan,
+      moraDiariaNegociacion: parsedMoraNeg,
       comisionPorcentaje: parsedComision,
       gastoAdminFijo: parsedGastoAdmin,
       selladoFijo: parsedSellado,

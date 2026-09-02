@@ -92,10 +92,11 @@ const getCobranzasList = async (filters = {}, pagination = { page: 1, length: 50
     // IMPORTANTE: usar restante actual (total - pagado) para mora en pagos parciales
     const restante = roundCurrency(primeraCuotaNoPagada.total - primeraCuotaNoPagada.pagado);
     
-    // Calcular mora si está vencida (sobre restante actual, no monto original)
+    // Calcular mora si está vencida (sobre restante actual, no monto original).
+    // Cuotas de plan → tasa de PLANES.
     let mora = 0;
     if (diasAtraso > 0 && restante > 0) {
-      mora = roundCurrency(restante * (config.moraDiariaDefault / 100) * diasAtraso);
+      mora = roundCurrency(restante * (config.moraDiariaPlan / 100) * diasAtraso);
     }
 
     // Determinar estado
@@ -265,8 +266,25 @@ const getMetricasDelMes = async () => {
     if (diasAtraso > 0) {
       // IMPORTANTE: usar restante actual (total - pagado) para pagos parciales
       const restante = roundCurrency(cuota.total - cuota.pagado);
-      const mora = roundCurrency(restante * (config.moraDiariaDefault / 100) * diasAtraso);
+      const mora = roundCurrency(restante * (config.moraDiariaPlan / 100) * diasAtraso);
       moraAcumulada += mora;
+    }
+  }
+
+  // Mora acumulada de las cuotas de SALDO (negociación), con su propia tasa.
+  const saldoCuotasConMora = await prisma.saldoCuota.findMany({
+    where: {
+      estado: { in: ['PENDIENTE', 'PARCIAL'] },
+      fechaVencimiento: { lt: hoy }
+    }
+  });
+  for (const sc of saldoCuotasConMora) {
+    const diasAtraso = calcularDiasAtraso(sc.fechaVencimiento, hoy);
+    if (diasAtraso > 0) {
+      const restante = roundCurrency(sc.monto - sc.pagado);
+      if (restante > 0) {
+        moraAcumulada += roundCurrency(restante * (config.moraDiariaNegociacion / 100) * diasAtraso);
+      }
     }
   }
   moraAcumulada = roundCurrency(moraAcumulada);

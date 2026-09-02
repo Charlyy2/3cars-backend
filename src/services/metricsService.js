@@ -81,7 +81,7 @@ const calcularMetricasVenta = async (saleId) => {
       if (hoy > fechaVencimiento) {
         const diasVencidos = Math.floor((hoy - fechaVencimiento) / (1000 * 60 * 60 * 24));
         const deudaRestante = roundCurrency(cuota.total - cuota.pagado);
-        const moraCuota = deudaRestante * (config.moraDiariaDefault / 100) * diasVencidos;
+        const moraCuota = deudaRestante * (config.moraDiariaPlan / 100) * diasVencidos;
         moraGenerada += moraCuota;
       }
     }
@@ -222,7 +222,7 @@ const calcularMetricasDashboard = async () => {
     const fechaVencimiento = new Date(cuota.fechaVencimiento);
     if (hoy > fechaVencimiento && cuota.estado !== 'PAGADO') {
       const diasVencidos = Math.floor((hoy - fechaVencimiento) / (1000 * 60 * 60 * 24));
-      moraMes += deudaRestante * (config.moraDiariaDefault / 100) * diasVencidos;
+      moraMes += deudaRestante * (config.moraDiariaPlan / 100) * diasVencidos;
     }
 
     // Contar estado de clientes
@@ -248,7 +248,17 @@ const calcularMetricasDashboard = async () => {
     where: { estado: { in: ['PENDIENTE', 'PARCIAL'] } },
   });
   for (const sc of saldoCuotasActivas) {
-    totalEsperadoMes += roundCurrency(sc.monto - sc.pagado);
+    const restanteSaldo = roundCurrency(sc.monto - sc.pagado);
+    totalEsperadoMes += restanteSaldo;
+
+    // Mora de saldo (negociación): misma fórmula diaria acumulativa, tasa propia.
+    const vencSaldo = new Date(sc.fechaVencimiento);
+    if (hoy > vencSaldo && restanteSaldo > 0) {
+      const diasVencidos = Math.floor((hoy - vencSaldo) / (1000 * 60 * 60 * 24));
+      if (diasVencidos > 0) {
+        moraMes += restanteSaldo * (config.moraDiariaNegociacion / 100) * diasVencidos;
+      }
+    }
   }
 
   // Contar clientes por estado
