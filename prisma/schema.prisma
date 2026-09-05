@@ -51,6 +51,12 @@ model InstallmentPlan {
   estado              String        @default("ACTIVO")
   observaciones       String?       @db.Text
 
+  // "Pago abierto": al alcanzar la cuota objetivo el operador puede elegir que el
+  // cliente siga pagando en vez de negociar. Con esto en true, el plan suma una
+  // cuota nueva por cada mes que pasa (mismo monto base, sin cargos), hasta que
+  // eventualmente se resuelve/negocia.
+  pagoAbierto         Boolean       @default(false)
+
   // Configuración de cargos del plan
   selladoMonto        Float         @default(0)
   cuotasConSellado    Int           @default(2)    // primeras 2 cuotas incluyen sellado

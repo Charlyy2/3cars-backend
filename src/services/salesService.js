@@ -170,6 +170,18 @@ const createSale = async ({
 };
 
 const getSaleByClientId = async (clientId) => {
+  // Si el cliente YA tiene CUALQUIER plan (sea cual sea su estado), ya hizo una
+  // venta y debe ir al detalle — aunque tenga todas las cuotas pagadas (llegó a
+  // la cuota objetivo) o no tenga registro de financiación. Sin esto, cualquier
+  // cliente sin `financing` terminaba mandado al wizard de nuevo plan.
+  const planExistente = await prisma.installmentPlan.findFirst({
+    where: { clientId: clientId },
+    select: { id: true },
+  });
+  if (planExistente) {
+    return { hasSale: true };
+  }
+
   // Primero buscar si hay cuotas activas para el cliente
   const activeInstallments = await prisma.installment.count({
     where: {

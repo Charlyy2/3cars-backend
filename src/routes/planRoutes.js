@@ -11,6 +11,7 @@ router.get('/:id', planController.getPlanById);
 router.post('/:id/retirar', planController.retirarVehiculo);
 router.post('/:id/cancelar', planController.cancelPlan);
 router.post('/:id/negociacion', planController.marcarNegociacion);
+router.post('/:id/seguir-pagando', planController.habilitarPagoAbierto);
 router.post('/:id/entrega-capital', planController.registrarEntregaCapital);
 router.post('/:id/resolver', planController.resolverPlan);
 router.post('/:id/iniciar-saldo', planController.iniciarSaldo);

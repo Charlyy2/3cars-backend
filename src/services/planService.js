@@ -357,21 +357,32 @@ const getPlanById = async (planId) => {
  * Obtener plan por cliente
  */
 const getPlanByClientId = async (clientId) => {
-  const plan = await prisma.installmentPlan.findFirst({
+  const includeShape = {
+    client: true,
+    installments: { orderBy: { numero: 'asc' } },
+    vehicle: true,
+    financing: true,
+  };
+
+  let plan = await prisma.installmentPlan.findFirst({
     where: {
       clientId: parseInt(clientId),
       estado: { in: ['ACTIVO', 'NEGOCIACION', 'RESUELTO'] }
     },
-    include: {
-      client: true,
-      installments: {
-        orderBy: { numero: 'asc' }
-      },
-      vehicle: true,
-      financing: true,
-    },
+    include: includeShape,
     orderBy: { fechaInicio: 'desc' },
   });
+
+  // "Pago abierto": generar (lazy) las cuotas mensuales que hayan vencido y recargar.
+  if (plan && plan.pagoAbierto && plan.estado === 'ACTIVO') {
+    const res = await materializeOpenInstallments(plan.id, prisma);
+    if (res.added > 0) {
+      plan = await prisma.installmentPlan.findFirst({
+        where: { id: plan.id },
+        include: includeShape,
+      });
+    }
+  }
 
   return plan;
 };
@@ -783,6 +794,107 @@ const checkAndCancelOverduePlans = async () => {
   };
 };
 
+// ============================================================
+// PAGO ABIERTO — el plan sigue sumando cuotas mensuales tras la cuota objetivo
+// ============================================================
+
+const _addMonths = (d, n) => { const x = new Date(d); x.setMonth(x.getMonth() + n); return x; };
+const _endOfMonth = (d) => new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+
+/**
+ * Materializa las cuotas mensuales que correspondan para un plan en "pago abierto".
+ * Agrega una cuota por cada mes transcurrido más allá de la última cuota (mismo
+ * monto base, sin sellado/retiro). Con `seed: true`, si no quedara ninguna cuota
+ * impaga, siembra la próxima para que el cliente pueda pagar en el acto.
+ *
+ * Idempotente: si no hay meses nuevos que cubrir, no crea nada.
+ * @param {number} planId
+ * @param {object} db - prisma o tx
+ * @param {{seed?: boolean}} opts
+ */
+const materializeOpenInstallments = async (planId, db = prisma, opts = {}) => {
+  const { seed = false } = opts;
+  const parsedId = parseInt(planId);
+
+  const plan = await db.installmentPlan.findUnique({
+    where: { id: parsedId },
+    include: { installments: { orderBy: { numero: 'asc' } } },
+  });
+  if (!plan || !plan.pagoAbierto || plan.estado !== 'ACTIVO') return { added: 0 };
+  const cuotas = plan.installments;
+  if (cuotas.length === 0) return { added: 0 };
+
+  const monto = Number(plan.montoCuotaBase || 0);
+  const limite = _endOfMonth(new Date()); // hasta el fin del mes actual
+  const last = cuotas[cuotas.length - 1];
+  let anchor = new Date(last.fechaVencimiento);
+  let numero = last.numero;
+  const nuevas = [];
+  let guard = 0;
+
+  const nuevaCuota = () => {
+    anchor = _addMonths(anchor, 1);
+    numero += 1;
+    nuevas.push({
+      planId: parsedId,
+      numero,
+      fechaVencimiento: anchor,
+      monto,
+      cargos: 0,
+      cargosDetalle: { sellado: 0, gastoRetiro: 0, mora: 0 },
+      total: monto,
+      pagado: 0,
+      estado: 'PENDIENTE',
+    });
+  };
+
+  // 1) Una cuota por cada mes ya vencido/transcurrido más allá de la última.
+  while (_addMonths(anchor, 1) <= limite && guard < 120) { nuevaCuota(); guard++; }
+
+  // 2) Al activar: si no quedó ninguna cuota impaga, sembrar la próxima.
+  const hayPendiente = cuotas.some(c => c.estado === 'PENDIENTE' || c.estado === 'PARCIAL') || nuevas.length > 0;
+  if (seed && !hayPendiente) nuevaCuota();
+
+  if (nuevas.length === 0) return { added: 0 };
+
+  await db.installment.createMany({ data: nuevas });
+  await db.installmentPlan.update({
+    where: { id: parsedId },
+    data: { totalCuotas: plan.totalCuotas + nuevas.length },
+  });
+  return { added: nuevas.length };
+};
+
+/**
+ * Habilita el "pago abierto" para un plan que alcanzó la cuota objetivo.
+ * El operador elige que el cliente siga pagando en vez de negociar. La negociación
+ * sigue disponible para más adelante.
+ */
+const habilitarPagoAbierto = async (planId) => {
+  const parsedId = parseInt(planId);
+  const plan = await prisma.installmentPlan.findUnique({
+    where: { id: parsedId },
+    include: { installments: true },
+  });
+  if (!plan) throw new Error('PLAN_NOT_FOUND');
+  if (plan.estado !== 'ACTIVO') throw new Error('PLAN_NOT_ACTIVE');
+
+  const cuotasPagadas = plan.installments.filter(c => c.estado === 'PAGADO').length;
+  if (!plan.cuotaObjetivoRetiro || cuotasPagadas < plan.cuotaObjetivoRetiro) {
+    throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
+  }
+
+  if (!plan.pagoAbierto) {
+    await prisma.installmentPlan.update({ where: { id: parsedId }, data: { pagoAbierto: true } });
+  }
+  await materializeOpenInstallments(parsedId, prisma, { seed: true });
+
+  return prisma.installmentPlan.findUnique({
+    where: { id: parsedId },
+    include: { installments: { orderBy: { numero: 'asc' } } },
+  });
+};
+
 module.exports = {
   createPlan,
   retirarVehiculo,
@@ -796,4 +908,6 @@ module.exports = {
   resolverPlan,
   iniciarSaldo,
   getSaldoByClientId,
+  materializeOpenInstallments,
+  habilitarPagoAbierto,
 };

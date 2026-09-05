@@ -87,6 +87,14 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   });
   console.log('✅ Payment creado:', payment.id);
 
+  // Si el plan está en "pago abierto", materializar las cuotas mensuales que
+  // correspondan (y sembrar una si no quedara ninguna impaga) para que el pago
+  // tenga dónde imputarse. Dentro de la misma transacción.
+  if (activePlan && activePlan.pagoAbierto && activePlan.estado === 'ACTIVO') {
+    const planService = require('./planService');
+    await planService.materializeOpenInstallments(activePlan.id, tx, { seed: true });
+  }
+
   // Obtener cuotas del cliente ordenadas por vencimiento y número.
   // Solo de planes que siguen en circuito de cobranza: una vez RESUELTO (pasó a
   // saldo), RETIRADO o CAIDO, sus cuotas dejan de ser exigibles y no admiten pago.

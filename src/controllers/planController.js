@@ -258,6 +258,30 @@ const marcarNegociacion = async (req, res) => {
 };
 
 /**
+ * Habilitar "pago abierto": el cliente alcanzó la cuota objetivo pero sigue pagando.
+ * El plan pasa a sumar una cuota por mes hasta que eventualmente se negocie.
+ */
+const habilitarPagoAbierto = async (req, res) => {
+  try {
+    const { id: planId } = req.params;
+    const plan = await planService.habilitarPagoAbierto(planId);
+    return res.status(200).json(plan);
+  } catch (error) {
+    if (error.message === 'PLAN_NOT_FOUND') {
+      return res.status(404).json({ error: 'Plan no encontrado' });
+    }
+    if (error.message === 'PLAN_NOT_ACTIVE') {
+      return res.status(400).json({ error: 'El plan no está activo' });
+    }
+    if (error.message === 'INSUFFICIENT_INSTALLMENTS_PAID') {
+      return res.status(400).json({ error: 'No se alcanzó la cuota objetivo' });
+    }
+    console.error('Error al habilitar pago abierto:', error);
+    return res.status(500).json({ error: 'Error al habilitar pago abierto' });
+  }
+};
+
+/**
  * Registrar entrega de capital (plan en NEGOCIACION) -> CashMovement automático
  */
 const registrarEntregaCapital = async (req, res) => {
@@ -395,6 +419,7 @@ module.exports = {
   getFallenPlans,
   checkAndCancelOverduePlans,
   marcarNegociacion,
+  habilitarPagoAbierto,
   registrarEntregaCapital,
   resolverPlan,
   iniciarSaldo,
