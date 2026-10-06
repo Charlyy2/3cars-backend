@@ -17,12 +17,12 @@ const updateConfig = async (req, res) => {
       moraDiariaDefault,
       moraDiariaPlan,
       moraDiariaNegociacion,
-      comisionPorcentaje,
       gastoAdminFijo,
       selladoFijo,
       gastoRetiroPorcentaje,
-      commissionRules,
-      includeSealInCommission
+      // commissionRules / comisionPorcentaje / includeSealInCommission: DEPRECADOS.
+      // En 3CARS no existe comisión; si llegan se ignoran y los valores guardados
+      // en Config se conservan sin efecto operativo.
     } = req.body;
 
     // Compatibilidad: si no llegan las tasas nuevas, usar la única anterior.
@@ -38,7 +38,6 @@ const updateConfig = async (req, res) => {
     const parsedTasa = Number(tasaAnualDefault);
     const parsedMoraPlan = Number(rawPlan);
     const parsedMoraNeg = Number(rawNeg);
-    const parsedComision = Number(comisionPorcentaje) || 10;
     const parsedGastoAdmin = Number(gastoAdminFijo) || 5;
     const parsedSellado = Number(selladoFijo) || 3;
     const parsedGastoRetiro = Number(gastoRetiroPorcentaje) || 5;
@@ -61,20 +60,10 @@ const updateConfig = async (req, res) => {
       moraDiariaDefault: parsedMoraPlan,
       moraDiariaPlan: parsedMoraPlan,
       moraDiariaNegociacion: parsedMoraNeg,
-      comisionPorcentaje: parsedComision,
       gastoAdminFijo: parsedGastoAdmin,
       selladoFijo: parsedSellado,
       gastoRetiroPorcentaje: parsedGastoRetiro,
     };
-
-    // Agregar commissionRules si se proporciona
-    if (commissionRules !== undefined) {
-      updateData.commissionRules = commissionRules;
-    }
-
-    if (includeSealInCommission !== undefined) {
-      updateData.includeSealInCommission = !!includeSealInCommission;
-    }
 
     const config = await configService.updateConfig(updateData);
 

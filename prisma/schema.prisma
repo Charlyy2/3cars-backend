@@ -37,6 +37,8 @@ model Client {
   audios      Audio[]
   vehicle     Vehicle?
   cashMovements CashMovement[]
+  planAjustes   PlanAjuste[]
+  entregasCapital EntregaCapital[]
 
   @@map("clients")
 }
@@ -96,6 +98,8 @@ model InstallmentPlan {
   saldoCuotas         SaldoCuota[]
   vehicle             Vehicle?      @relation(fields: [vehicleId], references: [id])
   financing           Financing?
+  ajustes             PlanAjuste[]
+  entregasCapital     EntregaCapital[]
 
   @@map("installment_plans")
 }
@@ -109,12 +113,18 @@ model Installment {
   cargos            Float              @default(0)  // suma de cargos adicionales (deprecated)
   cargosDetalle     Json?              // { comision, gastoRetiro, administrativo, sellado, mora }
   total             Float              // monto + cargos (calculado)
-  pagado            Float              @default(0)
+  pagado            Float              @default(0)   // dinero efectivamente pagado (nunca incluye ajustes)
+  // Caché de la suma de ajustes ACTIVOS (PlanAjuste) imputados a esta cuota.
+  // Deuda efectiva = total - pagado - ajustado. Un ajuste NO es un pago.
+  ajustado          Float              @default(0)
+  // PENDIENTE | PARCIAL | PAGADO | REGULARIZADA
+  // REGULARIZADA = saldada con ajustes (pagado + ajustado >= total, pagado < total).
   estado            String             @default("PENDIENTE")
 
   plan              InstallmentPlan    @relation(fields: [planId], references: [id])
   allocations       PaymentAllocation[]
   cashMovements     CashMovement[]
+  ajustes           PlanAjuste[]
 
   @@map("installments")
 }
@@ -261,15 +271,17 @@ model Config {
   moraDiariaNegociacion  Float  @default(0)
 
   // Nuevos campos para cargos adicionales
-  comisionPorcentaje     Float  @default(10)     // 10% (deprecated - usar commissionRules)
+  // DEPRECADOS (no existe comisión en 3CARS): se conservan los datos, sin efecto
+  // operativo. Nunca se generan movimientos COMISION_CUOTA.
+  comisionPorcentaje     Float  @default(10)
   gastoAdminFijo         Float  @default(5)      // $5 fijos
   selladoFijo            Float  @default(3)      // $3 fijos
   gastoRetiroPorcentaje  Float  @default(5)      // 5% del precio final
 
-  // Reglas dinámicas de comisión por cuota
-  commissionRules        Json?  @default("[]")   // [{ cuota: 1, porcentaje: 100 }, { cuota: 2, porcentaje: 30 }]
+  // DEPRECADO: reglas de comisión por cuota (histórico, sin efecto)
+  commissionRules        Json?  @default("[]")
 
-  // Si true, el sellado forma parte de la comisión. Si false, el sellado genera un ingreso independiente.
+  // DEPRECADO: ya no afecta pagos; el sellado cobrado siempre va a SELLADO.
   includeSealInCommission Boolean @default(false)
 
   @@map("config")
@@ -334,10 +346,87 @@ model CashMovement {
   payment       Payment?             @relation(fields: [paymentId], references: [id])
   client        Client?              @relation(fields: [clientId], references: [id])
   installment   Installment?         @relation(fields: [installmentId], references: [id])
+  entregaCapital EntregaCapital?
 
   @@index([origin])
   @@index([categoryId])
   @@index([clientId])
   @@index([createdAt])
   @@map("cash_movements")
+}
+
+// ============================================================
+// AJUSTES DEL OBJETIVO (regularización / condonación)
+// ============================================================
+// Reducen la deuda del objetivo SIN representar dinero: no generan Payment,
+// PaymentAllocation ni CashMovement. Se imputan a una cuota del objetivo
+// (cuotas 1..cuotaObjetivoRetiro) y nunca se borran: se anulan.
+model PlanAjuste {
+  id              Int          @id @default(autoincrement())
+  planId          Int
+  installmentId   Int?         // cuota del objetivo a la que se imputa
+  clientId        Int
+  tipo            String       // AJUSTE_COMERCIAL | CONDONACION | OTRO
+  monto           Float
+  motivo          String       @db.Text
+  estado          String       @default("ACTIVO") // ACTIVO | ANULADO
+
+  createdById     Int?
+  createdBy       String?
+  createdAt       DateTime     @default(now())
+
+  anuladoAt       DateTime?
+  anuladoById     Int?
+  anuladoBy       String?
+  motivoAnulacion String?      @db.Text
+
+  plan            InstallmentPlan @relation(fields: [planId], references: [id])
+  installment     Installment?    @relation(fields: [installmentId], references: [id])
+  client          Client          @relation(fields: [clientId], references: [id])
+
+  @@index([planId])
+  @@index([installmentId])
+  @@map("plan_ajustes")
+}
+
+// ============================================================
+// ENTREGAS DE CAPITAL (negociación)
+// ============================================================
+// Valor económico de la entrega vs impacto en Caja:
+//   valorTotal = montoDinero + vehiculoValorToma
+//   Caja       = solo montoDinero (CashMovement ENTREGA_CAPITAL, cashMovementId)
+// La toma de un vehículo NO genera dinero en Caja. No existe comisión de negociación.
+// Inmutable: no se edita ni se borra.
+model EntregaCapital {
+  id                    Int       @id @default(autoincrement())
+  planId                Int
+  clientId              Int
+  tipoEntrega           String    @default("DINERO") // DINERO | VEHICULO | MIXTA
+  montoDinero           Float     @default(0)
+
+  // Vehículo tomado como parte de pago (distinto del vehículo que RETIRA el cliente)
+  vehiculoValorToma     Float?
+  vehiculoPatente       String?
+  vehiculoAnio          Int?
+  vehiculoMarca         String?
+  vehiculoModelo        String?
+  vehiculoObservaciones String?   @db.Text
+
+  valorTotal            Float     // calculado SIEMPRE por el backend
+  // DEPRECADOS: no existe comisión de negociación. Quedan en 0 (se agregaron en la
+  // migración 20261006000000 y no se borran para no hacer una migración destructiva).
+  comisionPct           Float     @default(0)
+  comisionMonto         Float     @default(0)
+
+  cashMovementId        Int?      @unique // ingreso ENTREGA_CAPITAL (solo la parte en dinero)
+  observacion           String?   @db.Text
+  createdBy             String?
+  createdAt             DateTime  @default(now())
+
+  plan                  InstallmentPlan @relation(fields: [planId], references: [id])
+  client                Client          @relation(fields: [clientId], references: [id])
+  cashMovement          CashMovement?   @relation(fields: [cashMovementId], references: [id])
+
+  @@index([planId])
+  @@map("entregas_capital")
 }

@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { isCuotaSaldada, deudaEfectivaCuota, composicionCuota, evaluarObjetivo } = require('../helpers/objetivoHelper');
 const configService = require('./configService');
 
 const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -12,24 +13,27 @@ const calculateExpectedAdminForInstallment = (cuota, adminPct) => {
 };
 
 /**
- * Calcula comisión total y real de una cuota.
- * 
- * IMPORTANTE:
- * - commissionTotal: comisión esperada de la cuota (siempre se calcula)
- * - commissionReal: comisión reconocida solo si estado === 'PAGADO'
- * - Pagos parciales NO generan comisión hasta completar la cuota
+ * Suma montos de Caja por categoría (fuente monetaria real).
+ * En 3CARS NO existe comisión: COMISION_CUOTA / COMISION_NEGOCIACION solo pueden
+ * aparecer como movimientos HISTÓRICOS y siempre son EGRESOS (nunca ganancia).
+ * El único margen equivalente es GASTO_RETIRO_COBRADO - GASTO_RETIRO_REAL.
  */
-const calculateInstallmentCommissionProgress = (cuota, commissionHelper, config) => {
-  const commissionTotal = roundCurrency(commissionHelper.calculateCommissionAmount(cuota.numero, cuota.monto, config));
-  
-  // Comisión real solo si la cuota está PAGADA
-  const commissionReal = cuota.estado === 'PAGADO' ? commissionTotal : 0;
-
-  return {
-    commissionTotal,
-    commissionReal
-  };
+const sumarCajaPorCategoria = async (where) => {
+  const movs = await prisma.cashMovement.findMany({
+    where,
+    select: { amount: true, category: { select: { name: true } } },
+  });
+  const out = {};
+  for (const m of movs) out[m.category.name] = roundCurrency((out[m.category.name] || 0) + m.amount);
+  return out;
 };
+
+const margenRetiro = (porCat) =>
+  roundCurrency((porCat.GASTO_RETIRO_COBRADO || 0) - (porCat.GASTO_RETIRO_REAL || 0));
+
+// Comisiones históricas (egresos ya registrados en Caja antes de deprecarlas).
+const comisionesHistoricas = (porCat) =>
+  roundCurrency((porCat.COMISION_CUOTA || 0) + (porCat.COMISION_NEGOCIACION || 0));
 
 /**
  * Calcula métricas financieras de una venta específica
@@ -55,32 +59,24 @@ const calcularMetricasVenta = async (saleId) => {
   // Inicializar métricas
   let totalCobrado = 0;
   let totalEsperado = 0;
-  let comisionTotal = 0;
-  let comisionesPagadas = 0;
   let gastosAdministrativos = 0;
   let adminEstimado = 0;
   let selladoTotal = 0;
   let moraGenerada = 0;
 
   // Procesar cada cuota
-  const commissionHelper = require('../helpers/commissionHelper');
-  
   for (const cuota of plan.installments) {
     totalEsperado += cuota.total;
     adminEstimado += calculateExpectedAdminForInstallment(cuota, plan.administrativoPct);
 
-    const { commissionTotal, commissionReal } = calculateInstallmentCommissionProgress(cuota, commissionHelper, config);
-    comisionTotal += commissionTotal;
-    comisionesPagadas += commissionReal;
-
-    // Calcular mora si está vencida y no pagada completamente
-    if (cuota.estado !== 'PAGADO') {
+    // Calcular mora si está vencida y no saldada (pagada o regularizada)
+    if (!isCuotaSaldada(cuota.estado)) {
       const fechaVencimiento = new Date(cuota.fechaVencimiento);
       const hoy = new Date();
       
       if (hoy > fechaVencimiento) {
         const diasVencidos = Math.floor((hoy - fechaVencimiento) / (1000 * 60 * 60 * 24));
-        const deudaRestante = roundCurrency(cuota.total - cuota.pagado);
+        const deudaRestante = deudaEfectivaCuota(cuota);
         const moraCuota = deudaRestante * (config.moraDiariaPlan / 100) * diasVencidos;
         moraGenerada += moraCuota;
       }
@@ -98,38 +94,49 @@ const calcularMetricasVenta = async (saleId) => {
   gastosAdministrativos = roundCurrency(payments.reduce((sum, p) => sum + (p.montoAdmin || 0), 0));
 
   totalEsperado = roundCurrency(totalEsperado);
-  comisionTotal = roundCurrency(comisionTotal);
-  comisionesPagadas = roundCurrency(comisionesPagadas);
   adminEstimado = roundCurrency(adminEstimado);
   moraGenerada = roundCurrency(moraGenerada);
 
-  // Calcular sellado cobrado real (solo cuotas PAGADAS)
+  // Sellado cobrado real: el dinero que, por la cascada de imputación
+  // (cuota → sellado → gasto de retiro), efectivamente cubrió el sellado.
+  // Una cuota REGULARIZADA no implica sellado cobrado.
   let selladoCobrado = 0;
+  let totalAjustado = 0;
+  let deudaPendiente = 0;
   const selladoLog = [];
   for (const cuota of plan.installments) {
-    const selladoCuota = Number(cuota?.cargosDetalle?.sellado || 0);
-    if (selladoCuota > 0) {
-      if (cuota.estado === 'PAGADO') {
-        selladoCobrado += roundCurrency(selladoCuota);
-        selladoLog.push({ cuota: cuota.numero, sellado: selladoCuota, reconocido: true });
-      } else {
-        selladoLog.push({ cuota: cuota.numero, sellado: selladoCuota, reconocido: false, estado: cuota.estado });
-      }
+    const comp = composicionCuota(cuota);
+    totalAjustado += comp.ajustado;
+    deudaPendiente += deudaEfectivaCuota(cuota);
+    if (comp.sellado > 0) {
+      selladoCobrado += comp.selladoCobrado;
+      selladoLog.push({ cuota: cuota.numero, sellado: comp.sellado, cobrado: comp.selladoCobrado, estado: cuota.estado });
     }
   }
   selladoCobrado = roundCurrency(selladoCobrado);
+  totalAjustado = roundCurrency(totalAjustado);
+  deudaPendiente = roundCurrency(deudaPendiente);
   
   console.log('💵 Sellado cobrado:', { selladoCobrado, selladoTotal, detalle: selladoLog });
 
-  const gananciaEstimada = roundCurrency(comisionTotal + selladoTotal - adminEstimado);
-  const gananciaNeta = roundCurrency(comisionesPagadas + selladoCobrado - gastosAdministrativos);
+  // Desde Caja (fuente monetaria real):
+  //  - margen de retiro del cliente: GASTO_RETIRO_COBRADO - GASTO_RETIRO_REAL
+  //  - comisiones históricas de las cuotas del plan: EGRESO (restan, nunca suman)
+  const cajaCliente = await sumarCajaPorCategoria({ clientId: plan.clientId });
+  const cajaCuotasPlan = await sumarCajaPorCategoria({ installmentId: { in: plan.installments.map((c) => c.id) } });
+  const margenRetiroPlan = margenRetiro(cajaCliente);
+  const comisionHistoricaEgreso = comisionesHistoricas(cajaCuotasPlan);
+
+  // Sin comisión: la ganancia ya no suma comisiones.
+  const gananciaEstimada = roundCurrency(selladoTotal - adminEstimado);
+  const gananciaNeta = roundCurrency(selladoCobrado + margenRetiroPlan - gastosAdministrativos - comisionHistoricaEgreso);
   
   console.log('📊 Métricas calculadas:', {
     saleId: plan.id,
     totalCobrado,
     totalEsperado,
-    comisionTotal,
-    comisionesPagadas,
+    margenRetiro: margenRetiroPlan,
+    comisionHistoricaEgreso,
     selladoTotal,
     selladoCobrado,
     adminEstimado,
@@ -139,11 +146,13 @@ const calcularMetricasVenta = async (saleId) => {
   });
 
   const totalACobrar = roundCurrency(totalEsperado + selladoTotal);
-  const totalRestante = roundCurrency(Math.max(totalACobrar - totalCobrado, 0));
+  // Lo ajustado/condonado no es deuda pero tampoco es dinero cobrado.
+  const totalRestante = roundCurrency(Math.max(totalACobrar - totalCobrado - totalAjustado, 0));
   
   // Calcular cuotas pagadas para flag de retiro
   const cuotasPagadas = plan.installments.filter(c => c.estado === 'PAGADO').length;
-  const puedeRetirar = cuotasPagadas >= (plan.cuotaObjetivoRetiro || 0);
+  // Regla única del objetivo (pagado real + ajustes)
+  const puedeRetirar = evaluarObjetivo(plan, plan.installments).objetivoCumplido;
 
   return {
     saleId: plan.id,
@@ -153,9 +162,14 @@ const calcularMetricasVenta = async (saleId) => {
     totalEsperado,
     totalACobrar,
     totalRestante,
+    totalAjustado,      // condonado/ajustado (NO es dinero cobrado)
+    deudaPendiente,     // Σ deuda efectiva de las cuotas (total - pagado - ajustado)
     porcentajeCobrado: totalACobrar > 0 ? roundCurrency((totalCobrado / totalACobrar) * 100) : 0,
-    comisionTotal,
-    comisionesPagadas,
+    // @deprecated No existe comisión en 3CARS: siempre 0 (se mantienen las keys por compatibilidad).
+    comisionTotal: 0,
+    comisionesPagadas: 0,
+    comisionHistoricaEgreso, // COMISION_CUOTA/NEGOCIACION históricas en Caja (egreso)
+    margenRetiro: margenRetiroPlan, // GASTO_RETIRO_COBRADO - GASTO_RETIRO_REAL del cliente
     gastosAdministrativos,
     adminEstimado,
     selladoTotal,
@@ -208,14 +222,12 @@ const calcularMetricasDashboard = async () => {
 
   let totalEsperadoMes = 0;
   let moraMes = 0;
-  let comisionesMes = 0;
   let gastosMes = 0;
 
   const clientesEstado = new Map();
-  const commissionHelper = require('../helpers/commissionHelper');
 
   for (const cuota of cuotasActivas) {
-    const deudaRestante = roundCurrency(cuota.total - cuota.pagado);
+    const deudaRestante = deudaEfectivaCuota(cuota);
     totalEsperadoMes += deudaRestante;
 
     // Calcular mora
@@ -283,38 +295,21 @@ const calcularMetricasDashboard = async () => {
     }
   });
 
-  const allocationsMes = await prisma.paymentAllocation.findMany({
-    where: {
-      payment: {
-        fecha: {
-          gte: inicioMes,
-          lte: finMes
-        }
-      }
-    },
-    include: {
-      installment: true
-    }
-  });
-  
   gastosMes = roundCurrency(paymentsWithAdmin.reduce((sum, p) => sum + (p.montoAdmin || 0), 0));
-  comisionesMes = roundCurrency(allocationsMes.reduce((sum, allocation) => {
-    const installment = allocation.installment;
-    // Las allocations de SALDO no tienen installment (no devengan comisión): se ignoran.
-    if (!installment) return sum;
-    const installmentCommission = roundCurrency(commissionHelper.calculateCommissionAmount(installment.numero, installment.monto, config));
-    const installmentTotal = Number(installment.total || 0);
-    const ratio = installmentTotal > 0 ? Math.min(Number(allocation.monto || 0) / installmentTotal, 1) : 0;
 
-    return sum + roundCurrency(installmentCommission * ratio);
-  }, 0));
+  // Desde Caja del mes: margen de retiro (única "ganancia" equivalente) y
+  // comisiones HISTÓRICAS (egresos ya registrados; no se generan nuevas).
+  const cajaMes = await sumarCajaPorCategoria({ createdAt: { gte: inicioMes, lte: new Date(finMes.getFullYear(), finMes.getMonth(), finMes.getDate(), 23, 59, 59, 999) } });
+  const margenRetiroMes = margenRetiro(cajaMes);
+  const comisionesMes = comisionesHistoricas(cajaMes);
 
   gastosMes = roundCurrency(gastosMes);
   moraMes = roundCurrency(moraMes);
   totalCobradoMes = roundCurrency(totalCobradoMes);
   totalEsperadoMes = roundCurrency(totalEsperadoMes);
 
-  const gananciaMes = roundCurrency(comisionesMes - gastosMes);
+  // Antes: comisionesMes - gastosMes (la comisión sumaba como ganancia: incorrecto).
+  const gananciaMes = roundCurrency(margenRetiroMes - gastosMes - comisionesMes);
   const porcentajeCobranza = totalEsperadoMes > 0 
     ? roundCurrency((totalCobradoMes / (totalCobradoMes + totalEsperadoMes)) * 100) 
     : 0;
@@ -323,7 +318,8 @@ const calcularMetricasDashboard = async () => {
     totalCobradoMes,
     totalEsperadoMes,
     porcentajeCobranza,
-    comisionesMes,
+    comisionesMes, // solo comisiones históricas en Caja (egreso); 0 para operaciones nuevas
+    margenRetiroMes,
     gastosAdministrativosMes: gastosMes,
     moraMes,
     gananciaMes,
@@ -335,35 +331,7 @@ const calcularMetricasDashboard = async () => {
   };
 };
 
-/**
- * Calcula la ganancia de una cuota específica
- */
-const calcularGananciaCuota = (cuota, config) => {
-  let costos = 0;
-
-  // Comisión (solo cuotas 1 y 2)
-  if (cuota.numero === 1 || cuota.numero === 2) {
-    costos += cuota.monto * (config.comisionPorcentaje / 100);
-  }
-
-  // Gastos administrativos y sellado (desde cuota 2)
-  if (cuota.numero >= 2) {
-    costos += config.gastoAdminFijo + config.selladoFijo;
-  }
-
-  const ingreso = cuota.pagado;
-  const ganancia = ingreso - costos;
-
-  return {
-    ingreso,
-    costos,
-    ganancia,
-    porcentajeGanancia: ingreso > 0 ? (ganancia / ingreso) * 100 : 0
-  };
-};
-
 module.exports = {
   calcularMetricasVenta,
   calcularMetricasDashboard,
-  calcularGananciaCuota
 };

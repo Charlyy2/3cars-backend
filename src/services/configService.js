@@ -6,12 +6,11 @@ const DEFAULT_CONFIG = {
   moraDiariaDefault: 0,
   moraDiariaPlan: 0,
   moraDiariaNegociacion: 0,
-  comisionPorcentaje: 10,
   gastoAdminFijo: 5,
   selladoFijo: 3,
   gastoRetiroPorcentaje: 5,
-  commissionRules: [],
-  includeSealInCommission: false,
+  // comisionPorcentaje / commissionRules / includeSealInCommission: deprecados
+  // (no existe comisión en 3CARS). Quedan con los defaults del schema.
 };
 
 const getConfig = async () => {
@@ -42,12 +41,9 @@ const updateConfig = async ({
   moraDiariaDefault,
   moraDiariaPlan,
   moraDiariaNegociacion,
-  comisionPorcentaje,
   gastoAdminFijo,
   selladoFijo,
   gastoRetiroPorcentaje,
-  commissionRules,
-  includeSealInCommission
 }) => {
   const config = await getConfig();
 
@@ -63,20 +59,10 @@ const updateConfig = async ({
     moraDiariaDefault: planRate,
     moraDiariaPlan: planRate,
     moraDiariaNegociacion: negRate,
-    comisionPorcentaje,
     gastoAdminFijo,
     selladoFijo,
     gastoRetiroPorcentaje,
   };
-
-  // Solo actualizar commissionRules si se proporciona
-  if (commissionRules !== undefined) {
-    updateData.commissionRules = commissionRules;
-  }
-
-  if (includeSealInCommission !== undefined) {
-    updateData.includeSealInCommission = !!includeSealInCommission;
-  }
 
   return prisma.config.update({
     where: { id: config.id },

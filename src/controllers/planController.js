@@ -1,4 +1,24 @@
 const planService = require('../services/planService');
+const ajusteObjetivoService = require('../services/ajusteObjetivoService');
+
+const formatMoney = (v) => `$${Number(v || 0).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
+
+// Errores de validación de una entrega de capital (DINERO | VEHICULO | MIXTA).
+const ENTREGA_ERRORS = {
+  INVALID_TIPO_ENTREGA: [400, 'Tipo de entrega inválido (DINERO, VEHICULO o MIXTA)'],
+  INVALID_AMOUNT: [400, 'El monto en dinero debe ser mayor a 0'],
+  NEGATIVE_AMOUNT: [400, 'Los montos no pueden ser negativos'],
+  VEHICULO_REQUERIDO: [400, 'Faltan los datos del vehículo entregado'],
+  INVALID_VALOR_TOMA: [400, 'El valor de toma del vehículo debe ser mayor a 0'],
+  VEHICULO_PATENTE_REQUERIDA: [400, 'La patente del vehículo es obligatoria'],
+  VEHICULO_ANIO_INVALIDO: [400, 'El año del vehículo es inválido'],
+  VEHICULO_MARCA_REQUERIDA: [400, 'La marca del vehículo es obligatoria'],
+  VEHICULO_MODELO_REQUERIDO: [400, 'El modelo del vehículo es obligatorio'],
+};
+
+// Mensaje del rechazo de negociación: informa el saldo que falta si se conoce.
+const objetivoNoCumplidoMsg = (error, base) =>
+  error.objetivo ? `${base}: saldo pendiente ${formatMoney(error.objetivo.saldoPendienteEfectivo)}` : base;
 
 /**
  * Crear plan de pago sin vehículo
@@ -250,7 +270,7 @@ const marcarNegociacion = async (req, res) => {
       return res.status(400).json({ error: 'El plan no está activo' });
     }
     if (error.message === 'INSUFFICIENT_INSTALLMENTS_PAID') {
-      return res.status(400).json({ error: 'No se alcanzó la cuota objetivo para negociar' });
+      return res.status(400).json({ error: 'No se alcanzó la cuota objetivo para negociar', code: 'OBJETIVO_NO_CUMPLIDO' });
     }
     console.error('Error al marcar negociación:', error);
     return res.status(500).json({ error: 'Error al marcar negociación' });
@@ -287,14 +307,20 @@ const habilitarPagoAbierto = async (req, res) => {
 const registrarEntregaCapital = async (req, res) => {
   try {
     const { id: planId } = req.params;
-    const { monto, observacion } = req.body;
+    // `comisionPct` puede venir de clientes viejos: se ignora (no existe comisión de negociación).
+    const { monto, tipoEntrega, montoDinero, vehiculo, observacion } = req.body;
 
-    if (monto === undefined || monto === null) {
+    // Compatibilidad: sin tipoEntrega es DINERO y `monto` es obligatorio.
+    const tipo = String(tipoEntrega || 'DINERO').toUpperCase();
+    if (tipo === 'DINERO' && (monto === undefined || monto === null) && (montoDinero === undefined || montoDinero === null)) {
       return res.status(400).json({ error: 'monto es requerido' });
     }
 
     const result = await planService.registrarEntregaCapital(planId, {
       monto,
+      tipoEntrega,
+      montoDinero,
+      vehiculo,
       observacion,
       createdBy: req.user?.username || null,
     });
@@ -307,8 +333,9 @@ const registrarEntregaCapital = async (req, res) => {
     if (error.message === 'PLAN_NOT_IN_NEGOTIATION') {
       return res.status(400).json({ error: 'El plan no está en negociación' });
     }
-    if (error.message === 'INVALID_AMOUNT') {
-      return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+    if (ENTREGA_ERRORS[error.message]) {
+      const [code, msg] = ENTREGA_ERRORS[error.message];
+      return res.status(code).json({ error: msg });
     }
     console.error('Error al registrar entrega de capital:', error);
     return res.status(500).json({ error: 'Error al registrar entrega de capital' });
@@ -338,13 +365,18 @@ const resolverPlan = async (req, res) => {
 
     return res.status(201).json(result);
   } catch (error) {
+    if (error.message === 'INSUFFICIENT_INSTALLMENTS_PAID') {
+      return res.status(400).json({
+        error: objetivoNoCumplidoMsg(error, 'No se alcanzó la cuota objetivo'),
+        code: 'OBJETIVO_NO_CUMPLIDO',
+        objetivo: error.objetivo || null,
+      });
+    }
     const map = {
+      ...ENTREGA_ERRORS,
       PLAN_NOT_FOUND: [404, 'Plan no encontrado'],
       PLAN_NOT_RESOLVABLE: [400, 'El plan no se puede resolver en su estado actual'],
-      INSUFFICIENT_INSTALLMENTS_PAID: [400, 'No se alcanzó la cuota objetivo'],
       INVALID_VEHICLE_RESULT: [400, 'Resultado de vehículo inválido (NO_RETIRO, AUTO o MOTO)'],
-      INVALID_COMMISSION_PCT: [400, 'El porcentaje de comisión debe estar entre 0 y 100'],
-      NEGATIVE_AMOUNT: [400, 'Los montos no pueden ser negativos'],
     };
     if (map[error.message]) {
       const [code, msg] = map[error.message];
@@ -410,6 +442,96 @@ const getSaldo = async (req, res) => {
   }
 };
 
+// ============================================================
+// OBJETIVO / AJUSTES (regularización del saldo objetivo) / HISTORIAL
+// ============================================================
+
+const AJUSTE_ERRORS = {
+  PLAN_NOT_FOUND: [404, 'Plan no encontrado'],
+  PLAN_NOT_ACTIVE: [400, 'Solo se puede ajustar el objetivo de un plan activo (no negociado)'],
+  PLAN_SIN_OBJETIVO: [400, 'El plan no tiene cuota objetivo configurada'],
+  OBJETIVO_YA_CUMPLIDO: [409, 'El objetivo ya está cumplido: no hay saldo de cuota para ajustar (los cargos no se ajustan)'],
+  AJUSTE_CON_PAGOS_POSTERIORES: [409, 'No se puede anular: después del ajuste se cobraron cargos de esa cuota'],
+  INVALID_AJUSTE_TIPO: [400, 'Tipo de ajuste inválido (AJUSTE_COMERCIAL, CONDONACION u OTRO)'],
+  AJUSTE_MOTIVO_REQUERIDO: [400, 'El motivo del ajuste es obligatorio'],
+  INVALID_AMOUNT: [400, 'El monto del ajuste debe ser mayor a 0'],
+  AJUSTE_NOT_FOUND: [404, 'Ajuste no encontrado'],
+  AJUSTE_YA_ANULADO: [409, 'El ajuste ya está anulado'],
+  ANULACION_MOTIVO_REQUERIDO: [400, 'El motivo de la anulación es obligatorio'],
+};
+
+const handleAjusteError = (res, error, fallback) => {
+  if (error.message === 'AJUSTE_EXCEDE_SALDO') {
+    return res.status(400).json({
+      error: `El ajuste excede el saldo ajustable de las cuotas del objetivo (${formatMoney(error.saldoPendienteEfectivo)})`,
+      code: 'AJUSTE_EXCEDE_SALDO',
+      saldoPendienteEfectivo: error.saldoPendienteEfectivo,
+    });
+  }
+  if (AJUSTE_ERRORS[error.message]) {
+    const [code, msg] = AJUSTE_ERRORS[error.message];
+    return res.status(code).json({ error: msg, code: error.message });
+  }
+  console.error(`${fallback}:`, error);
+  return res.status(500).json({ error: fallback, detail: error.message });
+};
+
+const authUser = (req) => ({ id: req.user?.id || null, username: req.user?.username || null });
+
+/** GET /plans/:id/objetivo — resumen calculado por la regla de dominio única. */
+const getObjetivo = async (req, res) => {
+  try {
+    return res.json(await ajusteObjetivoService.getObjetivo(req.params.id));
+  } catch (error) {
+    return handleAjusteError(res, error, 'Error al obtener el objetivo del plan');
+  }
+};
+
+/** GET /plans/:id/ajustes-objetivo */
+const listarAjustes = async (req, res) => {
+  try {
+    return res.json(await ajusteObjetivoService.listarAjustes(req.params.id));
+  } catch (error) {
+    return handleAjusteError(res, error, 'Error al obtener los ajustes');
+  }
+};
+
+/** POST /plans/:id/ajustes-objetivo — { tipo, monto, motivo }. No genera movimientos de Caja. */
+const crearAjuste = async (req, res) => {
+  try {
+    const { tipo, monto, motivo } = req.body || {};
+    const result = await ajusteObjetivoService.crearAjuste(req.params.id, { tipo, monto, motivo, user: authUser(req) });
+    return res.status(201).json(result);
+  } catch (error) {
+    return handleAjusteError(res, error, 'Error al registrar el ajuste');
+  }
+};
+
+/** POST /plans/:id/ajustes-objetivo/:ajusteId/anular — { motivo }. No borra: anula. */
+const anularAjuste = async (req, res) => {
+  try {
+    const { motivo } = req.body || {};
+    const result = await ajusteObjetivoService.anularAjuste(req.params.id, req.params.ajusteId, { motivo, user: authUser(req) });
+    return res.json(result);
+  } catch (error) {
+    if (error.message === 'PLAN_NOT_ACTIVE') {
+      return res.status(409).json({ error: 'No se puede anular: el plan ya fue negociado', code: 'PLAN_NOT_ACTIVE' });
+    }
+    return handleAjusteError(res, error, 'Error al anular el ajuste');
+  }
+};
+
+/** GET /plans/:id/historial */
+const getHistorial = async (req, res) => {
+  try {
+    return res.json(await planService.getHistorial(req.params.id));
+  } catch (error) {
+    if (error.message === 'PLAN_NOT_FOUND') return res.status(404).json({ error: 'Plan no encontrado' });
+    console.error('Error al obtener historial del plan:', error);
+    return res.status(500).json({ error: 'Error al obtener historial del plan' });
+  }
+};
+
 module.exports = {
   createPlan,
   retirarVehiculo,
@@ -424,4 +546,9 @@ module.exports = {
   resolverPlan,
   iniciarSaldo,
   getSaldo,
+  getObjetivo,
+  listarAjustes,
+  crearAjuste,
+  anularAjuste,
+  getHistorial,
 };

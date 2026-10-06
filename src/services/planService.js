@@ -2,6 +2,8 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const configService = require('./configService');
 const cashMovementService = require('./cashMovementService');
+const { lockPlan } = require('../helpers/lockHelper');
+const { evaluarObjetivo, isCuotaSaldada, deudaEfectivaCuota } = require('../helpers/objetivoHelper');
 
 /**
  * Crear plan de pago sin vehículo
@@ -227,16 +229,18 @@ const retirarVehiculo = async (planId, vehicleId) => {
 
   // Calcular cuotas pagadas
   const cuotasPagadas = plan.installments.filter(c => c.estado === 'PAGADO').length;
-  
-  if (cuotasPagadas < plan.cuotaObjetivoRetiro) {
+
+  // Regla única del objetivo (pagado real + ajustes)
+  if (!evaluarObjetivo(plan, plan.installments).objetivoCumplido) {
     throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
   }
 
   // Calcular montos
   const montoPagado = plan.installments.reduce((sum, c) => sum + c.pagado, 0);
+  // Deuda efectiva: lo ajustado/condonado ya no se debe
   const saldoRestante = plan.installments
-    .filter(c => c.estado !== 'PAGADO')
-    .reduce((sum, c) => sum + (c.total - c.pagado), 0);
+    .filter(c => !isCuotaSaldada(c.estado))
+    .reduce((sum, c) => sum + deudaEfectivaCuota(c), 0);
   
   const montoRetiro = saldoRestante * (plan.retiroPct / 100);
   const saldoFinal = saldoRestante + montoRetiro;
@@ -333,36 +337,37 @@ const retirarVehiculo = async (planId, vehicleId) => {
 /**
  * Obtener plan por ID
  */
+// Relaciones del plan que la UI necesita para mostrar objetivo, ajustes y entregas.
+const PLAN_DETAIL_INCLUDE = {
+  client: true,
+  installments: { orderBy: { numero: 'asc' } },
+  vehicle: true,
+  financing: true,
+  ajustes: { orderBy: { createdAt: 'desc' }, include: { installment: { select: { numero: true } } } },
+  entregasCapital: { orderBy: { createdAt: 'desc' } },
+};
+
+// Agrega el resumen del objetivo calculado por la regla de dominio única.
+const withObjetivo = (plan) => (plan ? { ...plan, objetivo: evaluarObjetivo(plan, plan.installments) } : plan);
+
 const getPlanById = async (planId) => {
   const plan = await prisma.installmentPlan.findUnique({
     where: { id: parseInt(planId) },
-    include: {
-      client: true,
-      installments: {
-        orderBy: { numero: 'asc' }
-      },
-      vehicle: true,
-      financing: true,
-    },
+    include: PLAN_DETAIL_INCLUDE,
   });
 
   if (!plan) {
     throw new Error('PLAN_NOT_FOUND');
   }
 
-  return plan;
+  return withObjetivo(plan);
 };
 
 /**
  * Obtener plan por cliente
  */
 const getPlanByClientId = async (clientId) => {
-  const includeShape = {
-    client: true,
-    installments: { orderBy: { numero: 'asc' } },
-    vehicle: true,
-    financing: true,
-  };
+  const includeShape = PLAN_DETAIL_INCLUDE;
 
   let plan = await prisma.installmentPlan.findFirst({
     where: {
@@ -384,7 +389,7 @@ const getPlanByClientId = async (clientId) => {
     }
   }
 
-  return plan;
+  return withObjetivo(plan);
 };
 
 /**
@@ -394,22 +399,24 @@ const getPlanByClientId = async (clientId) => {
 const marcarNegociacion = async (planId) => {
   const parsedPlanId = parseInt(planId);
 
-  const plan = await prisma.installmentPlan.findUnique({
-    where: { id: parsedPlanId },
-    include: { installments: true },
-  });
+  return prisma.$transaction(async (tx) => {
+    // Serializado con pagos/ajustes: la regla se evalúa sobre datos confirmados.
+    await lockPlan(tx, parsedPlanId);
+    const plan = await tx.installmentPlan.findUnique({
+      where: { id: parsedPlanId },
+      include: { installments: true },
+    });
 
-  if (!plan) throw new Error('PLAN_NOT_FOUND');
-  if (plan.estado !== 'ACTIVO') throw new Error('PLAN_NOT_ACTIVE');
+    if (!plan) throw new Error('PLAN_NOT_FOUND');
+    if (plan.estado !== 'ACTIVO') throw new Error('PLAN_NOT_ACTIVE');
+    if (!evaluarObjetivo(plan, plan.installments).puedeNegociar) {
+      throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
+    }
 
-  const cuotasPagadas = plan.installments.filter((c) => c.estado === 'PAGADO').length;
-  if (cuotasPagadas < plan.cuotaObjetivoRetiro) {
-    throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
-  }
-
-  return prisma.installmentPlan.update({
-    where: { id: parsedPlanId },
-    data: { estado: 'NEGOCIACION' },
+    return tx.installmentPlan.update({
+      where: { id: parsedPlanId },
+      data: { estado: 'NEGOCIACION' },
+    });
   });
 };
 
@@ -417,41 +424,134 @@ const marcarNegociacion = async (planId) => {
  * Registrar una entrega de capital sobre un plan en NEGOCIACION.
  * Genera automáticamente un CashMovement INGRESO / ENTREGA_CAPITAL.
  */
-const registrarEntregaCapital = async (planId, { monto, observacion, createdBy }) => {
-  const parsedPlanId = parseInt(planId);
-  const amount = Number(monto);
-
-  if (isNaN(amount) || amount <= 0) {
-    throw new Error('INVALID_AMOUNT');
-  }
-
-  const plan = await prisma.installmentPlan.findUnique({
-    where: { id: parsedPlanId },
-    include: { client: true },
-  });
-
-  if (!plan) throw new Error('PLAN_NOT_FOUND');
-  if (plan.estado !== 'NEGOCIACION') throw new Error('PLAN_NOT_IN_NEGOTIATION');
-
-  return prisma.$transaction(async (tx) => {
-    const movement = await cashMovementService.recordCapitalDelivery(
-      {
-        clientId: plan.clientId,
-        planId: parsedPlanId,
-        amount,
-        description: observacion || `Entrega de capital (plan #${parsedPlanId})`,
-        createdBy,
-      },
-      tx
-    );
-
-    return { plan, movement };
-  });
-};
-
 const roundCurrency = (v) => Math.round((Number(v || 0) + Number.EPSILON) * 100) / 100;
 const { CAT } = require('../constants/cashCategories');
 const { ORIGIN } = cashMovementService;
+
+// ============================================================
+// ENTREGA DE CAPITAL — DINERO | VEHICULO | MIXTA
+// ============================================================
+//   valorTotal  = montoDinero + vehiculo.valorToma   (valor económico, lo calcula el backend)
+//   impactoCaja = montoDinero                        (la toma de un vehículo NO es dinero)
+// NO existe comisión de negociación (regla de negocio): ni sobre el dinero, ni
+// sobre la toma, ni sobre el total. `comisionPct` se acepta en el payload solo por
+// compatibilidad con clientes viejos y se ignora.
+
+const TIPOS_ENTREGA = ['DINERO', 'VEHICULO', 'MIXTA'];
+
+const normalizarPatente = (p) => String(p || '').trim().toUpperCase().replace(/\s+/g, '');
+
+const normalizarVehiculoToma = (v) => {
+  if (!v || typeof v !== 'object') throw new Error('VEHICULO_REQUERIDO');
+  const valorToma = roundCurrency(v.valorToma);
+  if (!Number.isFinite(Number(v.valorToma)) || !(valorToma > 0)) throw new Error('INVALID_VALOR_TOMA');
+  const patente = normalizarPatente(v.patente);
+  if (!patente) throw new Error('VEHICULO_PATENTE_REQUERIDA');
+  const anio = Number(v.anio);
+  const anioMax = new Date().getFullYear() + 1;
+  if (!Number.isInteger(anio) || anio < 1900 || anio > anioMax) throw new Error('VEHICULO_ANIO_INVALIDO');
+  const marca = String(v.marca || '').trim();
+  if (!marca) throw new Error('VEHICULO_MARCA_REQUERIDA');
+  const modelo = String(v.modelo || '').trim();
+  if (!modelo) throw new Error('VEHICULO_MODELO_REQUERIDO');
+  const observaciones = String(v.observaciones || '').trim() || null;
+  return { valorToma, patente, anio, marca, modelo, observaciones };
+};
+
+/**
+ * Valida y normaliza una entrega de capital. Ignora cualquier total enviado por el
+ * front y cualquier `comisionPct` (no existe comisión de negociación).
+ * Compatibilidad: sin `tipoEntrega` se interpreta como DINERO y `monto` se acepta
+ * como alias de `montoDinero` (payload anterior).
+ * Devuelve null si es una entrega en DINERO de $0 (antes no generaba nada).
+ */
+const normalizarEntrega = (entrega) => {
+  if (!entrega) return null;
+  const tipoEntrega = String(entrega.tipoEntrega || 'DINERO').trim().toUpperCase();
+  if (!TIPOS_ENTREGA.includes(tipoEntrega)) throw new Error('INVALID_TIPO_ENTREGA');
+
+  const rawDinero = entrega.montoDinero !== undefined && entrega.montoDinero !== null ? entrega.montoDinero : entrega.monto;
+  const montoDinero = tipoEntrega === 'VEHICULO' ? 0 : roundCurrency(rawDinero);
+  if (!Number.isFinite(montoDinero)) throw new Error('INVALID_AMOUNT');
+  if (montoDinero < 0) throw new Error('NEGATIVE_AMOUNT');
+
+  if (tipoEntrega === 'DINERO' && montoDinero === 0) return null;
+  if (tipoEntrega === 'MIXTA' && !(montoDinero > 0)) throw new Error('INVALID_AMOUNT');
+
+  const vehiculo = tipoEntrega === 'DINERO' ? null : normalizarVehiculoToma(entrega.vehiculo);
+  const valorTotal = roundCurrency(montoDinero + (vehiculo ? vehiculo.valorToma : 0));
+
+  return { tipoEntrega, montoDinero, vehiculo, valorTotal, impactoCaja: montoDinero };
+};
+
+/**
+ * Registra una entrega ya normalizada, dentro de la transacción recibida:
+ *  - CashMovement INGRESO ENTREGA_CAPITAL SOLO por la parte en dinero (si > 0);
+ *  - fila EntregaCapital con el valor económico y los datos del vehículo tomado.
+ * No genera ningún egreso de comisión. La entrega es inmutable (no se edita ni borra).
+ */
+const registrarEntregaNormalizada = async (tx, { plan, entrega, observacion, createdBy }) => {
+  const ref = `(plan #${plan.id})`;
+  const veh = entrega.vehiculo;
+  const movements = [];
+
+  let dineroMovement = null;
+  if (entrega.montoDinero > 0) {
+    const detalle = entrega.tipoEntrega === 'MIXTA'
+      ? ` — parte en dinero de entrega mixta; toma de vehículo ${veh.patente} ($${veh.valorToma}) no ingresa a caja`
+      : '';
+    dineroMovement = await cashMovementService.recordResolutionMovement({
+      categoryName: CAT.ENTREGA_CAPITAL, amount: entrega.montoDinero, origin: ORIGIN.CAPITAL_DELIVERY,
+      description: `${observacion || 'Entrega de capital'} ${ref}${detalle}`, clientId: plan.clientId, createdBy,
+    }, tx);
+    movements.push(dineroMovement);
+  }
+
+  const entregaCapital = await tx.entregaCapital.create({
+    data: {
+      planId: plan.id,
+      clientId: plan.clientId,
+      tipoEntrega: entrega.tipoEntrega,
+      montoDinero: entrega.montoDinero,
+      vehiculoValorToma: veh ? veh.valorToma : null,
+      vehiculoPatente: veh ? veh.patente : null,
+      vehiculoAnio: veh ? veh.anio : null,
+      vehiculoMarca: veh ? veh.marca : null,
+      vehiculoModelo: veh ? veh.modelo : null,
+      vehiculoObservaciones: veh ? veh.observaciones : null,
+      valorTotal: entrega.valorTotal,
+      cashMovementId: dineroMovement ? dineroMovement.id : null,
+      observacion: observacion || null,
+      createdBy: createdBy || null,
+    },
+  });
+
+  return { entregaCapital, movement: dineroMovement, movements };
+};
+
+/**
+ * Registrar una entrega de capital sobre un plan en NEGOCIACION (flujo viejo).
+ * Acepta DINERO | VEHICULO | MIXTA; solo la parte en dinero impacta Caja.
+ */
+const registrarEntregaCapital = async (planId, { monto, tipoEntrega, montoDinero, vehiculo, observacion, createdBy }) => {
+  const parsedPlanId = parseInt(planId);
+  const entrega = normalizarEntrega({ monto, tipoEntrega, montoDinero, vehiculo });
+  if (!entrega) throw new Error('INVALID_AMOUNT');
+
+  return prisma.$transaction(async (tx) => {
+    await lockPlan(tx, parsedPlanId);
+    const plan = await tx.installmentPlan.findUnique({
+      where: { id: parsedPlanId },
+      include: { client: true },
+    });
+
+    if (!plan) throw new Error('PLAN_NOT_FOUND');
+    if (plan.estado !== 'NEGOCIACION') throw new Error('PLAN_NOT_IN_NEGOTIATION');
+
+    const result = await registrarEntregaNormalizada(tx, { plan, entrega, observacion, createdBy });
+    return { plan, movement: result.movement, movements: result.movements, entregaCapital: result.entregaCapital };
+  });
+};
 
 /**
  * RESOLVER PLAN — flujo único de resolución (reemplaza negociación/retiro/devolución).
@@ -460,15 +560,16 @@ const { ORIGIN } = cashMovementService;
  * @param {number} planId
  * @param {object} data
  *   - vehiculo: 'NO_RETIRO' | 'AUTO' | 'MOTO'                (opcional, default NO_RETIRO)
- *   - entrega:  { monto, comisionPct }                       (opcional)
+ *   - entrega:  { tipoEntrega, montoDinero|monto, vehiculo } (opcional; comisionPct se ignora)
+ *               tipoEntrega: DINERO (default) | VEHICULO | MIXTA
  *   - gastoRetiro: { cobrado, real }                         (opcional)
  *   - devolucion: { monto }                                  (opcional)
  *   - observacion: string                                    (opcional)
  *   - createdBy: string
  *
  * Genera automáticamente (solo si el monto > 0):
- *   - INGRESO ENTREGA_CAPITAL        (entrega.monto)
- *   - EGRESO  COMISION_NEGOCIACION   (entrega.monto * comisionPct/100; 0% => no genera)
+ *   - INGRESO ENTREGA_CAPITAL        (SOLO la parte en dinero de la entrega)
+ *   (No existe comisión de negociación: nunca se genera COMISION_NEGOCIACION.)
  *   - INGRESO GASTO_RETIRO_COBRADO   (gastoRetiro.cobrado)
  *   - EGRESO  GASTO_RETIRO_REAL      (gastoRetiro.real)
  *   - EGRESO  DEVOLUCION             (devolucion.monto)
@@ -494,52 +595,49 @@ const resolverPlan = async (planId, data = {}) => {
   const RESULTADOS = ['NO_RETIRO', 'AUTO', 'MOTO'];
   if (!RESULTADOS.includes(vehiculo)) throw new Error('INVALID_VEHICLE_RESULT');
 
-  const plan = await prisma.installmentPlan.findUnique({
-    where: { id: parsedPlanId },
-    include: { installments: true, client: true },
-  });
-  if (!plan) throw new Error('PLAN_NOT_FOUND');
-  // Se puede resolver desde ACTIVO o NEGOCIACION (estado intermedio del flujo viejo).
-  if (!['ACTIVO', 'NEGOCIACION'].includes(plan.estado)) throw new Error('PLAN_NOT_RESOLVABLE');
-
-  // Precondición de negocio: haber alcanzado la cuota objetivo.
-  const cuotasPagadas = plan.installments.filter((c) => c.estado === 'PAGADO').length;
-  if (cuotasPagadas < plan.cuotaObjetivoRetiro) throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
-
-  // Normalizar montos de los bloques
-  const entregaMonto = entrega ? roundCurrency(entrega.monto) : 0;
-  const comisionPct = entrega ? Number(entrega.comisionPct || 0) : 0;
-  const comisionMonto = roundCurrency(entregaMonto * (comisionPct / 100));
+  // Normalizar montos de los bloques (validación antes de abrir la transacción)
+  const entregaNorm = normalizarEntrega(entrega);
   const retiroCobrado = gastoRetiro ? roundCurrency(gastoRetiro.cobrado) : 0;
   const retiroReal = gastoRetiro ? roundCurrency(gastoRetiro.real) : 0;
   const devolucionMonto = devolucion ? roundCurrency(devolucion.monto) : 0;
 
   // Validaciones básicas (no negativos)
-  [entregaMonto, comisionMonto, retiroCobrado, retiroReal, devolucionMonto].forEach((v) => {
+  [retiroCobrado, retiroReal, devolucionMonto].forEach((v) => {
     if (v < 0) throw new Error('NEGATIVE_AMOUNT');
   });
-  if (comisionPct < 0 || comisionPct > 100) throw new Error('INVALID_COMMISSION_PCT');
 
-  const clientId = plan.clientId;
   const ref = `(plan #${parsedPlanId})`;
 
   return prisma.$transaction(async (tx) => {
+    // Lock del plan: la precondición se evalúa sobre datos confirmados y no puede
+    // cambiar (pago/ajuste/anulación concurrente) antes de cerrar el plan.
+    await lockPlan(tx, parsedPlanId);
+    const plan = await tx.installmentPlan.findUnique({
+      where: { id: parsedPlanId },
+      include: { installments: true, client: true },
+    });
+    if (!plan) throw new Error('PLAN_NOT_FOUND');
+    // Se puede resolver desde ACTIVO o NEGOCIACION (estado intermedio del flujo viejo).
+    if (!['ACTIVO', 'NEGOCIACION'].includes(plan.estado)) throw new Error('PLAN_NOT_RESOLVABLE');
+
+    // Precondición de negocio: objetivo cumplido (pagado real + ajustes). Regla única.
+    const objetivo = evaluarObjetivo(plan, plan.installments);
+    if (!objetivo.puedeNegociar) {
+      const err = new Error('INSUFFICIENT_INSTALLMENTS_PAID');
+      err.objetivo = objetivo;
+      throw err;
+    }
+
+    const clientId = plan.clientId;
     const movements = [];
     const push = (m) => { if (m) movements.push(m); };
 
-    // --- Bloque Entrega de capital ---
-    if (entregaMonto > 0) {
-      push(await cashMovementService.recordResolutionMovement({
-        categoryName: CAT.ENTREGA_CAPITAL, amount: entregaMonto, origin: ORIGIN.CAPITAL_DELIVERY,
-        description: `Entrega de capital ${ref}`, clientId, createdBy,
-      }, tx));
-      // Comisión de negociación (solo si > 0)
-      if (comisionMonto > 0) {
-        push(await cashMovementService.recordResolutionMovement({
-          categoryName: CAT.COMISION_NEGOCIACION, amount: comisionMonto, origin: ORIGIN.SYSTEM,
-          description: `Comisión de negociación ${comisionPct}% ${ref}`, clientId, createdBy,
-        }, tx));
-      }
+    // --- Bloque Entrega de capital (solo la parte en dinero impacta Caja) ---
+    let entregaCapital = null;
+    if (entregaNorm) {
+      const r = await registrarEntregaNormalizada(tx, { plan, entrega: entregaNorm, observacion: null, createdBy });
+      r.movements.forEach(push);
+      entregaCapital = r.entregaCapital;
     }
 
     // --- Bloque Gastos de retiro ---
@@ -567,7 +665,23 @@ const resolverPlan = async (planId, data = {}) => {
     // --- Cerrar el plan ---
     const resolucionDetalle = {
       vehiculo,
-      entrega: entrega ? { monto: entregaMonto, comisionPct, comisionMonto } : null,
+      // `monto` se mantiene por compatibilidad = dinero entregado (lo que impacta Caja).
+      entrega: entregaNorm ? {
+        tipoEntrega: entregaNorm.tipoEntrega,
+        monto: entregaNorm.montoDinero,
+        montoDinero: entregaNorm.montoDinero,
+        vehiculo: entregaNorm.vehiculo,
+        valorTotal: entregaNorm.valorTotal,
+        impactoCaja: entregaNorm.impactoCaja,
+        entregaCapitalId: entregaCapital ? entregaCapital.id : null,
+      } : null,
+      // Composición del objetivo al momento de negociar (pagado real vs ajustado).
+      objetivo: {
+        objetivoOriginal: objetivo.objetivoOriginal,
+        pagadoReal: objetivo.pagadoReal,
+        ajustesAplicados: objetivo.ajustesAplicados,
+        saldoPendienteEfectivo: objetivo.saldoPendienteEfectivo,
+      },
       gastoRetiro: gastoRetiro ? { cobrado: retiroCobrado, real: retiroReal, margen: roundCurrency(retiroCobrado - retiroReal) } : null,
       devolucion: devolucion ? { monto: devolucionMonto } : null,
       observacion: observacion || null,
@@ -590,7 +704,7 @@ const resolverPlan = async (planId, data = {}) => {
       },
     });
 
-    return { plan: updatedPlan, movements, resumen: resolucionDetalle };
+    return { plan: updatedPlan, movements, entregaCapital, resumen: resolucionDetalle };
   });
 };
 
@@ -761,7 +875,7 @@ const checkAndCancelOverduePlans = async () => {
 
     for (const installment of plan.installments) {
       const isOverdue = installment.fechaVencimiento < today;
-      const isUnpaid = installment.estado !== 'PAGADO';
+      const isUnpaid = !isCuotaSaldada(installment.estado);
 
       if (isOverdue && isUnpaid) {
         consecutiveUnpaid++;
@@ -879,8 +993,8 @@ const habilitarPagoAbierto = async (planId) => {
   if (!plan) throw new Error('PLAN_NOT_FOUND');
   if (plan.estado !== 'ACTIVO') throw new Error('PLAN_NOT_ACTIVE');
 
-  const cuotasPagadas = plan.installments.filter(c => c.estado === 'PAGADO').length;
-  if (!plan.cuotaObjetivoRetiro || cuotasPagadas < plan.cuotaObjetivoRetiro) {
+  const objetivo = evaluarObjetivo(plan, plan.installments);
+  if (!objetivo.tieneObjetivo || !objetivo.objetivoCumplido) {
     throw new Error('INSUFFICIENT_INSTALLMENTS_PAID');
   }
 
@@ -893,6 +1007,99 @@ const habilitarPagoAbierto = async (planId) => {
     where: { id: parsedId },
     include: { installments: { orderBy: { numero: 'asc' } } },
   });
+};
+
+// ============================================================
+// HISTORIAL DEL PLAN — ajustes, anulaciones, entregas de capital y negociación
+// ============================================================
+// No existe un sistema central de auditoría: el historial se arma desde los
+// propios registros (que guardan quién y cuándo). Nada se reescribe.
+
+const entregaToEvento = (e) => ({
+  tipo: 'ENTREGA_CAPITAL',
+  fecha: e.createdAt,
+  usuario: e.createdBy,
+  entregaId: e.id,
+  tipoEntrega: e.tipoEntrega,
+  montoDinero: e.montoDinero,
+  vehiculo: e.tipoEntrega === 'DINERO' ? null : {
+    valorToma: e.vehiculoValorToma, patente: e.vehiculoPatente, anio: e.vehiculoAnio,
+    marca: e.vehiculoMarca, modelo: e.vehiculoModelo, observaciones: e.vehiculoObservaciones,
+  },
+  valorTotal: e.valorTotal,
+  impactoCaja: e.montoDinero,
+  observacion: e.observacion,
+  legacy: false,
+});
+
+const getHistorial = async (planId) => {
+  const parsedPlanId = parseInt(planId);
+  const plan = await prisma.installmentPlan.findUnique({
+    where: { id: parsedPlanId },
+    include: {
+      ajustes: { include: { installment: { select: { numero: true } } } },
+      entregasCapital: true,
+    },
+  });
+  if (!plan) throw new Error('PLAN_NOT_FOUND');
+
+  const eventos = [];
+
+  for (const a of plan.ajustes) {
+    eventos.push({
+      tipo: 'AJUSTE_OBJETIVO',
+      fecha: a.createdAt,
+      usuario: a.createdBy,
+      ajusteId: a.id,
+      tipoAjuste: a.tipo,
+      monto: a.monto,
+      motivo: a.motivo,
+      cuotaNumero: a.installment?.numero ?? null,
+      estado: a.estado,
+    });
+    if (a.estado === 'ANULADO') {
+      eventos.push({
+        tipo: 'AJUSTE_ANULADO',
+        fecha: a.anuladoAt,
+        usuario: a.anuladoBy,
+        ajusteId: a.id,
+        tipoAjuste: a.tipo,
+        monto: a.monto,
+        motivo: a.motivoAnulacion,
+        cuotaNumero: a.installment?.numero ?? null,
+      });
+    }
+  }
+
+  plan.entregasCapital.forEach((e) => eventos.push(entregaToEvento(e)));
+
+  // Entregas anteriores a la modalidad: solo existe el ingreso ENTREGA_CAPITAL en
+  // Caja (sin fila EntregaCapital). Se interpretan como DINERO.
+  const legacyMovs = await prisma.cashMovement.findMany({
+    where: { clientId: plan.clientId, category: { name: CAT.ENTREGA_CAPITAL }, entregaCapital: null },
+    orderBy: { createdAt: 'asc' },
+  });
+  const planesDelCliente = await prisma.installmentPlan.count({ where: { clientId: plan.clientId } });
+  for (const m of legacyMovs) {
+    if (planesDelCliente > 1 && !String(m.description || '').includes(`plan #${parsedPlanId}`)) continue;
+    eventos.push({
+      tipo: 'ENTREGA_CAPITAL', fecha: m.createdAt, usuario: m.createdBy, entregaId: null,
+      tipoEntrega: 'DINERO', montoDinero: m.amount, vehiculo: null, valorTotal: m.amount,
+      impactoCaja: m.amount, observacion: m.description, legacy: true,
+    });
+  }
+
+  if (plan.fechaResolucion) {
+    eventos.push({
+      tipo: 'NEGOCIACION',
+      fecha: plan.fechaResolucion,
+      resultadoVehiculo: plan.resultadoVehiculo,
+      observacion: plan.resolucionDetalle?.observacion || null,
+    });
+  }
+
+  eventos.sort((x, y) => new Date(y.fecha) - new Date(x.fecha));
+  return eventos;
 };
 
 module.exports = {
@@ -910,4 +1117,6 @@ module.exports = {
   getSaldoByClientId,
   materializeOpenInstallments,
   habilitarPagoAbierto,
+  getHistorial,
+  normalizarEntrega,
 };

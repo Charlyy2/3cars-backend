@@ -3,6 +3,8 @@ const prisma = new PrismaClient();
 const { updatePlanStatusForClient } = require('./installmentService');
 const cashMovementService = require('./cashMovementService');
 const configService = require('./configService');
+const { lockClientOpenPlans } = require('../helpers/lockHelper');
+const { estadoCuota } = require('../helpers/objetivoHelper');
 
 const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -73,6 +75,10 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   // caja), se revierte TODO para garantizar consistencia financiera.
   // ============================================================
   const result = await prisma.$transaction(async (tx) => {
+  // Serializar con ajustes del objetivo y negociación sobre los mismos planes:
+  // las cuotas se leen DESPUÉS del lock, con lo ajustado ya confirmado.
+  await lockClientOpenPlans(tx, clientId);
+
   // Crear el registro de pago
   console.log('📝 Creando Payment...');
   const payment = await tx.payment.create({
@@ -133,13 +139,15 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   for (const installment of installments) {
     if (remainingAmount <= 0) break;
 
-    // Usar total en lugar de monto para la imputación
-    const debtRemaining = roundCurrency(installment.total - installment.pagado);
+    // Usar total en lugar de monto para la imputación. Lo ajustado/condonado ya
+    // no es deuda: un pago nunca se imputa sobre un saldo condonado.
+    const debtRemaining = roundCurrency(installment.total - installment.pagado - (installment.ajustado || 0));
     
     if (debtRemaining > 0) {
       const amountToApply = Math.min(remainingAmount, debtRemaining);
       const newPagado = roundCurrency(installment.pagado + amountToApply);
-      const newEstado = newPagado >= roundCurrency(installment.total) ? 'PAGADO' : 'PARCIAL';
+      // PAGADO solo si el dinero cubre el total; con ajustes queda REGULARIZADA.
+      const newEstado = estadoCuota({ total: installment.total, pagado: newPagado, ajustado: installment.ajustado || 0 });
       
       console.log(`💰 Aplicando a cuota #${installment.numero}:`, {
         cuotaId: installment.id,

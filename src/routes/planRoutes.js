@@ -15,5 +15,11 @@ router.post('/:id/seguir-pagando', planController.habilitarPagoAbierto);
 router.post('/:id/entrega-capital', planController.registrarEntregaCapital);
 router.post('/:id/resolver', planController.resolverPlan);
 router.post('/:id/iniciar-saldo', planController.iniciarSaldo);
+// Objetivo del plan: regularización (ajustes/condonaciones) e historial
+router.get('/:id/objetivo', planController.getObjetivo);
+router.get('/:id/ajustes-objetivo', planController.listarAjustes);
+router.post('/:id/ajustes-objetivo', planController.crearAjuste);
+router.post('/:id/ajustes-objetivo/:ajusteId/anular', planController.anularAjuste);
+router.get('/:id/historial', planController.getHistorial);
 
 module.exports = router;

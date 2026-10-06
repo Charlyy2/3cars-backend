@@ -24,6 +24,8 @@ const CASH_CATEGORIES = [
 
   // ===== EGRESOS =====
   // Automáticos
+  // HISTÓRICAS: en 3CARS no existe comisión. Se conservan solo para los movimientos
+  // ya registrados (egresos); el sistema no genera movimientos nuevos con ellas.
   { name: 'COMISION_CUOTA',       label: 'Comisión por cuota',       type: 'EGRESO', system: true, isManual: false, requiresClient: false },
   { name: 'COMISION_NEGOCIACION', label: 'Comisión de negociación',  type: 'EGRESO', system: true, isManual: false, requiresClient: false },
   { name: 'GASTO_RETIRO_REAL',    label: 'Gasto de retiro real',     type: 'EGRESO', system: true, isManual: false, requiresClient: false },
@@ -54,8 +56,7 @@ const CAT = {
   GASTO_RETIRO_COBRADO: 'GASTO_RETIRO_COBRADO',
   GASTO_RETIRO_REAL: 'GASTO_RETIRO_REAL',
   SELLADO: 'SELLADO',
-  COMISION_CUOTA: 'COMISION_CUOTA',
-  COMISION_NEGOCIACION: 'COMISION_NEGOCIACION',
+  // Históricas (no se generan): COMISION_CUOTA, COMISION_NEGOCIACION
   DEVOLUCION: 'DEVOLUCION',
 };
 

@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { composicionCuota } = require('../helpers/objetivoHelper');
 
 const updatePlanStatusForClient = async (clientId, db = prisma) => {
   const parsedClientId = parseInt(clientId);
@@ -117,7 +118,7 @@ const getPlansByClientId = async (clientId) => {
 const getInstallmentsByClientId = async (clientId) => {
   await updatePlanStatusForClient(clientId);
 
-  return await prisma.installment.findMany({
+  const installments = await prisma.installment.findMany({
     where: {
       plan: {
         clientId: parseInt(clientId)
@@ -139,6 +140,9 @@ const getInstallmentsByClientId = async (clientId) => {
       numero: 'asc'
     }
   });
+
+  // Composición (cuota vs cargos, cobrado vs ajustado) calculada por el helper de dominio.
+  return installments.map((i) => ({ ...i, composicion: composicionCuota(i) }));
 };
 
 module.exports = {

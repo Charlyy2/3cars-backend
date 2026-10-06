@@ -1,7 +1,7 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
-const { getCommissionForInstallment } = require('../helpers/commissionHelper');
 const { CAT } = require('../constants/cashCategories');
+const { composicionCuota } = require('../helpers/objetivoHelper');
 
 const roundCurrency = (value) =>
   Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -50,158 +50,60 @@ const createMovementRaw = async (data, db = prisma) => {
 // ============================================================
 
 /**
- * Devenga en caja una cuota que acaba de quedar PAGADA.
- * Descompone el total cobrado SIN doble conteo:
- *   total = monto(base) + sellado + gastoRetiro + mora
- *   - COBRO_CUOTA (INGRESO) = monto base + mora      [origin PAYMENT]
- *   - GASTO_RETIRO (INGRESO) = porción gastoRetiro    [origin WITHDRAWAL]
- *   - SELLADO (INGRESO) = porción sellado, solo si !includeSealInCommission [origin PAYMENT]
- *   - COMISION_CUOTA (EGRESO) = % según commissionRules [origin PAYMENT]
+ * Devenga en caja una cuota que acaba de quedar PAGADA de una sola vez (p. ej.
+ * primera cuota pagada al crear el plan). Delega en recordInstallmentPayment
+ * para que exista UN solo camino de devengamiento.
  *
- * @param {object} installment - cuota PAGADA (numero, monto, cargosDetalle)
- * @param {object} ctx - { clientId, paymentId, config, createdBy }
+ * @param {object} installment - cuota PAGADA (numero, monto, cargosDetalle, total)
+ * @param {object} ctx - { clientId, paymentId, createdBy }
  * @param {object} db - cliente prisma o tx (debe usarse el tx del Payment)
  */
-const recordInstallmentPaid = async (installment, ctx, db = prisma) => {
-  const { clientId, paymentId, createdBy } = ctx;
-  const config = ctx.config || (await db.config.findFirst({ orderBy: { id: 'asc' } }));
-
-  const detalle = installment.cargosDetalle || {};
-  const sellado = roundCurrency(detalle.sellado || 0);
-  const gastoRetiro = roundCurrency(detalle.gastoRetiro || 0);
-  const mora = roundCurrency(detalle.mora || 0);
-  const base = roundCurrency(installment.monto || 0);
-
-  const includeSeal = !!(config && config.includeSealInCommission);
-
-  const movements = [];
-  const baseLink = {
-    clientId: clientId ? parseInt(clientId) : null,
-    paymentId: paymentId || null,
-    installmentId: installment.id,
-    createdBy: createdBy || null,
-  };
-
-  // 1) INGRESO COBRO_CUOTA = base + mora
-  const cobroCuota = roundCurrency(base + mora);
-  if (cobroCuota > 0) {
-    const cat = await getCategoryByName(CAT.COBRO_CUOTA, db);
-    movements.push(
-      await createMovementRaw(
-        {
-          ...baseLink,
-          categoryId: cat.id,
-          amount: cobroCuota,
-          origin: ORIGIN.PAYMENT,
-          description: `Cobro cuota #${installment.numero}${mora > 0 ? ' (incluye mora)' : ''}`,
-        },
-        db
-      )
-    );
-  }
-
-  // 2) INGRESO GASTO_RETIRO_COBRADO (porción de retiro cobrada en esta cuota)
-  if (gastoRetiro > 0) {
-    const cat = await getCategoryByName(CAT.GASTO_RETIRO_COBRADO, db);
-    movements.push(
-      await createMovementRaw(
-        {
-          ...baseLink,
-          categoryId: cat.id,
-          amount: gastoRetiro,
-          origin: ORIGIN.WITHDRAWAL,
-          description: `Gasto de retiro cobrado en cuota #${installment.numero}`,
-        },
-        db
-      )
-    );
-  }
-
-  // 3) Sellado: independiente si NO forma parte de la comisión; si forma parte,
-  //    se suma al cobro de la cuota para no perder el dinero.
-  //    El sellado solo aplica a las primeras 2 cuotas (regla de negocio fija).
-  if (sellado > 0 && installment.numero <= 2) {
-    if (!includeSeal) {
-      const cat = await getCategoryByName(CAT.SELLADO, db);
-      movements.push(
-        await createMovementRaw(
-          {
-            ...baseLink,
-            categoryId: cat.id,
-            amount: sellado,
-            origin: ORIGIN.PAYMENT,
-            description: `Sellado cuota #${installment.numero}`,
-          },
-          db
-        )
-      );
-    } else {
-      const cat = await getCategoryByName(CAT.COBRO_CUOTA, db);
-      movements.push(
-        await createMovementRaw(
-          {
-            ...baseLink,
-            categoryId: cat.id,
-            amount: sellado,
-            origin: ORIGIN.PAYMENT,
-            description: `Sellado (incluido en comisión) cuota #${installment.numero}`,
-          },
-          db
-        )
-      );
-    }
-  }
-
-  // 4) EGRESO COMISION_CUOTA según reglas.
-  //    Base de cálculo: monto base; si includeSeal, suma el sellado.
-  const comisionBase = includeSeal ? roundCurrency(base + sellado) : base;
-  const pct = getCommissionForInstallment(installment.numero, config || {});
-  const comision = roundCurrency(comisionBase * (pct / 100));
-  if (comision > 0) {
-    const cat = await getCategoryByName(CAT.COMISION_CUOTA, db);
-    movements.push(
-      await createMovementRaw(
-        {
-          ...baseLink,
-          categoryId: cat.id,
-          amount: comision,
-          origin: ORIGIN.PAYMENT,
-          description: `Comisión cuota #${installment.numero} (${pct}%)`,
-        },
-        db
-      )
-    );
-  }
-
-  return movements;
-};
+const recordInstallmentPaid = async (installment, ctx, db = prisma) =>
+  recordInstallmentPayment(
+    {
+      installment: { ...installment, pagado: 0, ajustado: Number(installment.ajustado || 0) },
+      pagadoAntes: 0,
+      newPagado: Number(installment.total || 0),
+    },
+    ctx,
+    db
+  );
 
 /**
  * Devenga en caja un PAGO sobre una cuota (parcial o total).
  *
- * Modelo:
- *  - total cuota = base + mora + sellado + gastoRetiro
- *  - "cobro base" devengable = base + mora (categoría COBRO_CUOTA)
- *  - En CADA pago se devenga COBRO_CUOTA por la porción del monto aplicado que
- *    todavía corresponde a la base+mora no devengada (la plata entra a caja al instante).
- *  - Al quedar la cuota PAGADA se devengan los conceptos no-base completos:
- *    SELLADO (ingreso), GASTO_RETIRO_COBRADO (ingreso) y COMISION_CUOTA (egreso),
- *    más el remanente de base+mora si quedara por redondeo.
+ * Regla de imputación (confirmada): el dinero cubre PRIMERO el importe de la
+ * cuota (base + mora) y después los cargos: sellado → gasto de retiro.
+ * Cada pago registra en Caja exactamente el dinero que, por esa cascada, fue a
+ * cada concepto (diferencia entre la composición antes y después del pago):
+ *   - COBRO_CUOTA          ← porción de cuota (base + mora)
+ *   - SELLADO              ← porción de sellado
+ *   - GASTO_RETIRO_COBRADO ← porción de gasto de retiro
+ * Lo ajustado/condonado (installment.ajustado) nunca entra a Caja: solo baja el
+ * tope de dinero de la cuota (ver composicionCuota).
  *
- * @param {object} af - { installment, amountApplied, pagadoAntes, newPagado, quedaPagada }
- * @param {object} ctx - { clientId, paymentId, config, createdBy }
+ * En 3CARS NO existe comisión: nunca se genera COMISION_CUOTA (categoría solo
+ * histórica). Config.commissionRules / comisionPorcentaje / includeSealInCommission
+ * están deprecados y no afectan los pagos.
+ *
+ * @param {object} af - { installment, pagadoAntes, newPagado }
+ * @param {object} ctx - { clientId, paymentId, createdBy }
  */
 const recordInstallmentPayment = async (af, ctx, db = prisma) => {
-  const { installment, amountApplied, pagadoAntes, quedaPagada } = af;
+  const { installment, pagadoAntes, newPagado } = af;
   const { clientId, paymentId, createdBy } = ctx;
-  const config = ctx.config || (await db.config.findFirst({ orderBy: { id: 'asc' } }));
 
   const detalle = installment.cargosDetalle || {};
   const sellado = roundCurrency(detalle.sellado || 0);
-  const gastoRetiro = roundCurrency(detalle.gastoRetiro || 0);
   const mora = roundCurrency(detalle.mora || 0);
-  const base = roundCurrency(installment.monto || 0);
-  const includeSeal = !!(config && config.includeSealInCommission);
+
+  // Composición antes / después del pago (mismo ajustado: el pago no lo cambia).
+  const antes = composicionCuota({ ...installment, pagado: pagadoAntes || 0 });
+  const despues = composicionCuota({ ...installment, pagado: newPagado });
+  const delta = (k) => roundCurrency(despues[k] - antes[k]);
+  const cobroAhora = delta('cuotaCobrada');
+  const selladoAhora = delta('selladoCobrado');
+  const retiroAhora = delta('gastoRetiroCobrado');
 
   const movements = [];
   const baseLink = {
@@ -210,62 +112,31 @@ const recordInstallmentPayment = async (af, ctx, db = prisma) => {
     installmentId: installment.id,
     createdBy: createdBy || null,
   };
-
-  // Tope de cobro base+mora a devengar a lo largo de toda la cuota.
-  const cobroBaseTope = roundCurrency(base + mora);
-  // Cuánto del cobro base ya se devengó antes de este pago (= min(pagadoAntes, tope)).
-  const cobroBasePrevio = roundCurrency(Math.min(roundCurrency(pagadoAntes || 0), cobroBaseTope));
-  // Cuánto del cobro base puedo devengar con el monto aplicado en ESTE pago.
-  const cobroBaseRestante = roundCurrency(cobroBaseTope - cobroBasePrevio);
-  const cobroAhora = roundCurrency(Math.min(roundCurrency(amountApplied || 0), Math.max(cobroBaseRestante, 0)));
 
   if (cobroAhora > 0) {
     const cat = await getCategoryByName(CAT.COBRO_CUOTA, db);
     movements.push(await createMovementRaw({
       ...baseLink, categoryId: cat.id, amount: cobroAhora, origin: ORIGIN.PAYMENT,
-      description: `Cobro cuota #${installment.numero}${mora > 0 ? ' (incluye mora)' : ''}${quedaPagada ? '' : ' (parcial)'}`,
+      description: `Cobro cuota #${installment.numero}${mora > 0 ? ' (incluye mora)' : ''}${despues.cuotaPendiente > 0 ? ' (parcial)' : ''}`,
     }, db));
   }
 
-  // Conceptos no-base: SOLO al quedar la cuota completamente PAGADA.
-  if (quedaPagada) {
-    // Sellado (solo cuotas 1-2). Si va incluido en comisión, suma al cobro; si no, categoría propia.
-    if (sellado > 0 && installment.numero <= 2) {
-      if (!includeSeal) {
-        const cat = await getCategoryByName(CAT.SELLADO, db);
-        movements.push(await createMovementRaw({
-          ...baseLink, categoryId: cat.id, amount: sellado, origin: ORIGIN.PAYMENT,
-          description: `Sellado cuota #${installment.numero}`,
-        }, db));
-      } else {
-        const cat = await getCategoryByName(CAT.COBRO_CUOTA, db);
-        movements.push(await createMovementRaw({
-          ...baseLink, categoryId: cat.id, amount: sellado, origin: ORIGIN.PAYMENT,
-          description: `Sellado (incluido en comisión) cuota #${installment.numero}`,
-        }, db));
-      }
-    }
+  // Sellado efectivamente cobrado (siempre en su categoría propia).
+  if (selladoAhora > 0) {
+    const cat = await getCategoryByName(CAT.SELLADO, db);
+    movements.push(await createMovementRaw({
+      ...baseLink, categoryId: cat.id, amount: selladoAhora, origin: ORIGIN.PAYMENT,
+      description: `Sellado cuota #${installment.numero}${despues.selladoCobrado < sellado ? ' (parcial)' : ''}`,
+    }, db));
+  }
 
-    // Gasto de retiro cobrado
-    if (gastoRetiro > 0) {
-      const cat = await getCategoryByName(CAT.GASTO_RETIRO_COBRADO, db);
-      movements.push(await createMovementRaw({
-        ...baseLink, categoryId: cat.id, amount: gastoRetiro, origin: ORIGIN.WITHDRAWAL,
-        description: `Gasto de retiro cobrado en cuota #${installment.numero}`,
-      }, db));
-    }
-
-    // Comisión (egreso) según reglas. Base: monto base; si includeSeal, suma el sellado.
-    const comisionBase = includeSeal ? roundCurrency(base + sellado) : base;
-    const pct = getCommissionForInstallment(installment.numero, config || {});
-    const comision = roundCurrency(comisionBase * (pct / 100));
-    if (comision > 0) {
-      const cat = await getCategoryByName(CAT.COMISION_CUOTA, db);
-      movements.push(await createMovementRaw({
-        ...baseLink, categoryId: cat.id, amount: comision, origin: ORIGIN.PAYMENT,
-        description: `Comisión cuota #${installment.numero} (${pct}%)`,
-      }, db));
-    }
+  // Gasto de retiro efectivamente cobrado
+  if (retiroAhora > 0) {
+    const cat = await getCategoryByName(CAT.GASTO_RETIRO_COBRADO, db);
+    movements.push(await createMovementRaw({
+      ...baseLink, categoryId: cat.id, amount: retiroAhora, origin: ORIGIN.WITHDRAWAL,
+      description: `Gasto de retiro cobrado en cuota #${installment.numero}${despues.gastoRetiroCobrado < despues.gastoRetiro ? ' (parcial)' : ''}`,
+    }, db));
   }
 
   return movements;

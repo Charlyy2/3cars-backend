@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { isCuotaSaldada, deudaEfectivaCuota } = require('../helpers/objetivoHelper');
 const configService = require('./configService');
 
 const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -69,13 +70,13 @@ const getCobranzasList = async (filters = {}, pagination = { page: 1, length: 50
     const plan = client.plans[0];
     
     // Buscar primera cuota no pagada
-    let primeraCuotaNoPagada = plan.installments.find(c => c.estado !== 'PAGADO');
+    let primeraCuotaNoPagada = plan.installments.find(c => !isCuotaSaldada(c.estado));
     
     // Si hay filtro de cuota, buscar esa cuota específica
     if (cuota) {
       const cuotaNum = parseInt(cuota);
       if (!isNaN(cuotaNum)) {
-        primeraCuotaNoPagada = plan.installments.find(c => c.numero === cuotaNum && c.estado !== 'PAGADO');
+        primeraCuotaNoPagada = plan.installments.find(c => c.numero === cuotaNum && !isCuotaSaldada(c.estado));
       }
     }
     
@@ -90,7 +91,7 @@ const getCobranzasList = async (filters = {}, pagination = { page: 1, length: 50
     const diasAtraso = calcularDiasAtraso(primeraCuotaNoPagada.fechaVencimiento, hoy);
     
     // IMPORTANTE: usar restante actual (total - pagado) para mora en pagos parciales
-    const restante = roundCurrency(primeraCuotaNoPagada.total - primeraCuotaNoPagada.pagado);
+    const restante = deudaEfectivaCuota(primeraCuotaNoPagada);
     
     // Calcular mora si está vencida (sobre restante actual, no monto original).
     // Cuotas de plan → tasa de PLANES.
@@ -205,47 +206,19 @@ const getMetricasDelMes = async () => {
 
   const totalCobrado = roundCurrency(pagosMes.reduce((sum, p) => sum + (p.montoTotal || 0), 0));
   
-  // Obtener comisiones del mes (solo de cuotas pagadas en el mes)
-  // Usar PaymentAllocation para determinar cuotas pagadas en el período
-  const allocationsMes = await prisma.paymentAllocation.findMany({
+  // En 3CARS NO existe comisión: no se calcula ninguna comisión nueva.
+  // `comisionGenerada` solo refleja COMISION_CUOTA HISTÓRICAS registradas en Caja
+  // en el mes (egresos); para operaciones nuevas es 0.
+  const comisionesHistoricasMes = await prisma.cashMovement.aggregate({
     where: {
-      payment: {
-        fecha: {
-          gte: inicioMes,
-          lte: finMes
-        }
-      }
+      createdAt: { gte: inicioMes, lte: finMes },
+      category: { name: { in: ['COMISION_CUOTA', 'COMISION_NEGOCIACION'] } },
     },
-    include: {
-      payment: true,
-      installment: {
-        include: {
-          plan: true
-        }
-      }
-    }
+    _sum: { amount: true },
   });
-
-  // Obtener cuotas únicas pagadas en el mes
-  const cuotasPagadasMesMap = new Map();
-  for (const allocation of allocationsMes) {
-    const cuota = allocation.installment;
-    // Las allocations de SALDO no tienen installment: se ignoran en cobranzas.
-    if (cuota && cuota.estado === 'PAGADO') {
-      cuotasPagadasMesMap.set(cuota.id, cuota);
-    }
-  }
-  const cuotasPagadasMes = Array.from(cuotasPagadasMesMap.values());
+  const comisionGenerada = roundCurrency(comisionesHistoricasMes._sum.amount || 0);
 
   const config = await configService.getConfig();
-  const commissionHelper = require('../helpers/commissionHelper');
-  
-  let comisionGenerada = 0;
-  for (const cuota of cuotasPagadasMes) {
-    const comision = commissionHelper.calculateCommissionAmount(cuota.numero, cuota.monto, config);
-    comisionGenerada += roundCurrency(comision);
-  }
-  comisionGenerada = roundCurrency(comisionGenerada);
 
   // Calcular mora acumulada del mes (con fechas normalizadas)
   const cuotasConMora = await prisma.installment.findMany({
@@ -265,7 +238,7 @@ const getMetricasDelMes = async () => {
     const diasAtraso = calcularDiasAtraso(cuota.fechaVencimiento, hoy);
     if (diasAtraso > 0) {
       // IMPORTANTE: usar restante actual (total - pagado) para pagos parciales
-      const restante = roundCurrency(cuota.total - cuota.pagado);
+      const restante = deudaEfectivaCuota(cuota);
       const mora = roundCurrency(restante * (config.moraDiariaPlan / 100) * diasAtraso);
       moraAcumulada += mora;
     }

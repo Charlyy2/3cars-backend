@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { isCuotaSaldada, deudaEfectivaCuota } = require('../helpers/objetivoHelper');
 
 const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -61,7 +62,7 @@ const getCollectionReport = async (modo) => {
     let deudaVencida = 0;
     for (const cuota of cuotas) {
       const isOverdue = cuota.fechaVencimiento < today;
-      const remainingDebt = cuota.total - cuota.pagado;
+      const remainingDebt = deudaEfectivaCuota(cuota);
       
       if (isOverdue && remainingDebt > 0) {
         deudaVencida += remainingDebt;
@@ -69,7 +70,7 @@ const getCollectionReport = async (modo) => {
     }
 
     // Calcular total a pagar según regla final del negocio
-    const remainingDebtPrimeraCuota = primeraCuota.total - primeraCuota.pagado;
+    const remainingDebtPrimeraCuota = deudaEfectivaCuota(primeraCuota);
     const primeraCuotaVencida = primeraCuota.fechaVencimiento < today;
     
     let totalAPagar;
@@ -110,7 +111,7 @@ const getCollectionReport = async (modo) => {
 
     for (const installment of allInstallments) {
       const isOverdue = installment.fechaVencimiento < today;
-      const isUnpaid = installment.estado !== 'PAGADO';
+      const isUnpaid = !isCuotaSaldada(installment.estado);
 
       if (isOverdue && isUnpaid) {
         overdueInstallments++;

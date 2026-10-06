@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { isCuotaSaldada } = require('../helpers/objetivoHelper');
 
 const getClientStatus = async (clientId) => {
   // Obtener todas las cuotas del cliente ordenadas por número
@@ -22,7 +23,7 @@ const getClientStatus = async (clientId) => {
 
   for (const installment of installments) {
     const isOverdue = installment.fechaVencimiento < today;
-    const isUnpaid = installment.estado !== 'PAGADO';
+    const isUnpaid = !isCuotaSaldada(installment.estado);
 
     if (isOverdue && isUnpaid) {
       overdueInstallments++;

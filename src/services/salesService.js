@@ -102,7 +102,6 @@ const createSale = async ({
 
     // Calcular gasto de retiro (se agrega a la cuota 1)
     const gastoRetiro = precioTotal * (retirPct / 100);
-    const commissionHelper = require('../helpers/commissionHelper');
 
     const installmentsData = Array.from({ length: cantidadCuotas }, (_, index) => {
       const numero = index + 1;
