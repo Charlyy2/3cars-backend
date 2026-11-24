@@ -3,8 +3,9 @@ const prisma = new PrismaClient();
 const { updatePlanStatusForClient } = require('./installmentService');
 const cashMovementService = require('./cashMovementService');
 const configService = require('./configService');
-const { lockClientOpenPlans } = require('../helpers/lockHelper');
+const { lockClientOpenPlans, lockPlan } = require('../helpers/lockHelper');
 const { estadoCuota } = require('../helpers/objetivoHelper');
+const { fechaPago, rangoDia } = require('../helpers/fechaHelper');
 
 const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -18,8 +19,23 @@ const roundCurrency = (value) => Math.round((Number(value || 0) + Number.EPSILON
  * - Comisión y sellado solo se reconocen cuando la cuota queda PAGADA
  * - Sobrepagos se distribuyen automáticamente a cuotas siguientes
  * - Excedentes finales se guardan como saldo a favor
+ *
+ * PLAN DE DESTINO (opts.planId):
+ * - Sin planId (comportamiento histórico): se imputa a las cuotas de los planes
+ *   ACTIVO / NEGOCIACION del cliente. Nunca a un plan CAIDO.
+ * - Con planId: se imputa SOLO a las cuotas de ese plan (debe ser del cliente y
+ *   estar ACTIVO, NEGOCIACION o CAIDO). Es la única forma de cobrar un plan
+ *   CAIDO: el pago se registra normalmente (imputaciones + Caja) y el plan
+ *   SIGUE CAIDO hasta una reactivación explícita.
  */
-const createPayment = async (clientId, monto, administrativoPct = undefined, fecha = undefined) => {
+const ESTADOS_PAGO_DIRIGIDO = ['ACTIVO', 'NEGOCIACION', 'CAIDO'];
+
+const createPayment = async (clientId, monto, administrativoPct = undefined, fecha = undefined, opts = {}) => {
+  const planDestinoId = opts.planId !== undefined && opts.planId !== null && opts.planId !== ''
+    ? parseInt(opts.planId) : null;
+  if (opts.planId !== undefined && opts.planId !== null && opts.planId !== '' && !(planDestinoId > 0)) {
+    throw new Error('PLAN_DESTINO_INVALIDO');
+  }
   console.log('🔄 Iniciando creación de pago:', { clientId, monto, administrativoPct });
   
   // VALIDACIONES CRÍTICAS
@@ -28,6 +44,8 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   if (isNaN(montoTotal) || montoTotal <= 0) {
     throw new Error('El monto del pago debe ser mayor a 0');
   }
+  // Fecha calendario del pago (medianoche UTC del día elegido; sin fecha = hoy).
+  const fechaRegistro = fechaPago(fecha);
   
   if (montoTotal > 100000000) {
     console.warn(`⚠️ ADVERTENCIA: Pago muy alto detectado: $${montoTotal} para cliente ${clientId}`);
@@ -42,7 +60,15 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
     throw new Error('Cliente no encontrado');
   }
 
-  const activePlan = await prisma.installmentPlan.findFirst({
+  // Plan de destino explícito: validar pertenencia y estado (se revalida tras el lock).
+  let planDestino = null;
+  if (planDestinoId) {
+    planDestino = await prisma.installmentPlan.findUnique({ where: { id: planDestinoId } });
+    if (!planDestino || planDestino.clientId !== parseInt(clientId)) throw new Error('PLAN_DESTINO_INVALIDO');
+    if (!ESTADOS_PAGO_DIRIGIDO.includes(planDestino.estado)) throw new Error('PLAN_NO_ADMITE_PAGOS');
+  }
+
+  const activePlan = planDestino || await prisma.installmentPlan.findFirst({
     where: {
       clientId: parseInt(clientId),
       estado: 'ACTIVO'
@@ -78,6 +104,12 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   // Serializar con ajustes del objetivo y negociación sobre los mismos planes:
   // las cuotas se leen DESPUÉS del lock, con lo ajustado ya confirmado.
   await lockClientOpenPlans(tx, clientId);
+  if (planDestinoId) {
+    // El plan de destino puede estar CAIDO (no lo cubre el lock anterior).
+    await lockPlan(tx, planDestinoId);
+    const vigente = await tx.installmentPlan.findUnique({ where: { id: planDestinoId }, select: { estado: true } });
+    if (!vigente || !ESTADOS_PAGO_DIRIGIDO.includes(vigente.estado)) throw new Error('PLAN_NO_ADMITE_PAGOS');
+  }
 
   // Crear el registro de pago
   console.log('📝 Creando Payment...');
@@ -88,7 +120,7 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
       montoAplicado,
       montoAdmin,
       origen: 'CUOTA',
-      ...(fecha ? { fecha: new Date(fecha) } : {})
+      fecha: fechaRegistro
     }
   });
   console.log('✅ Payment creado:', payment.id);
@@ -107,10 +139,13 @@ const createPayment = async (clientId, monto, administrativoPct = undefined, fec
   console.log('🔍 Buscando cuotas del cliente...');
   const installments = await tx.installment.findMany({
     where: {
-      plan: {
-        clientId: parseInt(clientId),
-        estado: { in: ['ACTIVO', 'NEGOCIACION'] }
-      },
+      // Con plan de destino: solo sus cuotas (nunca las de otro plan del cliente).
+      plan: planDestinoId
+        ? { id: planDestinoId, clientId: parseInt(clientId) }
+        : {
+            clientId: parseInt(clientId),
+            estado: { in: ['ACTIVO', 'NEGOCIACION'] }
+          },
       estado: {
         in: ['PENDIENTE', 'PARCIAL']
       }
@@ -315,15 +350,9 @@ const getAllPayments = async (filters = {}, pagination = { page: 1, length: 50 }
   
   if (fechaDesde || fechaHasta) {
     where.fecha = {};
-    // Parsear "YYYY-MM-DD" como día LOCAL (no UTC) para no correr el rango por zona horaria.
-    if (fechaDesde) {
-      const [y, m, d] = String(fechaDesde).slice(0, 10).split('-').map(Number);
-      where.fecha.gte = new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0);
-    }
-    if (fechaHasta) {
-      const [y, m, d] = String(fechaHasta).slice(0, 10).split('-').map(Number);
-      where.fecha.lte = new Date(y, (m || 1) - 1, d || 1, 23, 59, 59, 999);
-    }
+    // Payment.fecha es fecha calendario (medianoche UTC): límites UTC del día.
+    if (fechaDesde) where.fecha.gte = rangoDia(fechaDesde).gte;
+    if (fechaHasta) where.fecha.lt = rangoDia(fechaHasta).lt;
   }
   
   // Get payments with includes
@@ -448,6 +477,7 @@ const createSaldoPayment = async (clientId, monto, opts = {}) => {
   const { fecha, createdBy } = opts;
   const montoTotal = roundCurrency(Number(monto));
   if (isNaN(montoTotal) || montoTotal <= 0) throw new Error('El monto del pago debe ser mayor a 0');
+  const fechaRegistro = fechaPago(fecha);
 
   const parsedClientId = parseInt(clientId);
   const client = await prisma.client.findUnique({ where: { id: parsedClientId } });
@@ -468,7 +498,7 @@ const createSaldoPayment = async (clientId, monto, opts = {}) => {
         montoAplicado: montoTotal,
         montoAdmin: 0,
         origen: 'SALDO',
-        ...(fecha ? { fecha: new Date(fecha) } : {}),
+        fecha: fechaRegistro,
       },
     });
 

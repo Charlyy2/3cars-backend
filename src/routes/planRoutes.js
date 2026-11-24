@@ -20,6 +20,12 @@ router.get('/:id/objetivo', planController.getObjetivo);
 router.get('/:id/ajustes-objetivo', planController.listarAjustes);
 router.post('/:id/ajustes-objetivo', planController.crearAjuste);
 router.post('/:id/ajustes-objetivo/:ajusteId/anular', planController.anularAjuste);
+// Modificar valor de cuota (importe base de las cuotas abiertas; no mueve Caja)
+router.get('/:id/modificar-cuotas/preview', planController.previewModificacionCuotas);
+router.post('/:id/modificar-cuotas', planController.modificarCuotas);
+// Reactivar un plan CAÍDO (acción explícita; requiere < 3 cuotas vencidas impagas)
+router.get('/:id/reactivar/preview', planController.previewReactivacion);
+router.post('/:id/reactivar', planController.reactivarPlan);
 router.get('/:id/historial', planController.getHistorial);
 
 module.exports = router;

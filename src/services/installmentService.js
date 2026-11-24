@@ -2,11 +2,32 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const { composicionCuota } = require('../helpers/objetivoHelper');
 
+// Regla ÚNICA de caída por mora: un plan con UMBRAL_CAIDA o más cuotas vencidas
+// impagas (PENDIENTE / PARCIAL con vencimiento anterior a ahora) cae. La usan la
+// caída automática y la reactivación (que exige estar por debajo del umbral).
+const UMBRAL_CAIDA = 3;
+
+const ESTADOS_IMPAGOS = ['PENDIENTE', 'PARCIAL'];
+
+const contarVencidasImpagas = (db, planId, ahora = new Date()) =>
+  db.installment.count({
+    where: {
+      planId: parseInt(planId),
+      fechaVencimiento: { lt: ahora },
+      estado: { in: ESTADOS_IMPAGOS },
+    },
+  });
+
+/**
+ * Caída automática por mora. SOLO aplica a planes ACTIVOS: NEGOCIACION,
+ * RESUELTO, RETIRADO (y CAIDO) conservan su estado aunque tengan cuotas
+ * vencidas (p. ej. un plan RESUELTO deja sus cuotas pendientes como estaban).
+ */
 const updatePlanStatusForClient = async (clientId, db = prisma) => {
   const parsedClientId = parseInt(clientId);
 
   const plans = await db.installmentPlan.findMany({
-    where: { clientId: parsedClientId },
+    where: { clientId: parsedClientId, estado: 'ACTIVO' },
     select: { id: true, estado: true }
   });
 
@@ -17,34 +38,26 @@ const updatePlanStatusForClient = async (clientId, db = prisma) => {
   const today = new Date();
 
   for (const plan of plans) {
-    if (plan.estado === 'CAIDO') {
-      continue;
-    }
+    const overdueUnpaidCount = await contarVencidasImpagas(db, plan.id, today);
 
-    const overdueUnpaidCount = await db.installment.count({
-      where: {
-        planId: plan.id,
-        fechaVencimiento: {
-          lt: today
-        },
-        estado: {
-          in: ['PENDIENTE', 'PARCIAL']
-        }
-      }
-    });
-
-    if (overdueUnpaidCount >= 3) {
-      await db.installmentPlan.update({
-        where: { id: plan.id },
-        data: { estado: 'CAIDO' }
+    if (overdueUnpaidCount >= UMBRAL_CAIDA) {
+      // updateMany con estado ACTIVO en el WHERE: si otra operación ya cambió
+      // el estado (p. ej. una resolución), no se pisa.
+      await db.installmentPlan.updateMany({
+        where: { id: plan.id, estado: 'ACTIVO' },
+        data: { estado: 'CAIDO', motivoCaida: 'MORA_AUTOMATICA' }
       });
     }
   }
 };
 
 const createInstallmentPlan = async (clientId, totalCuotas, montoCuota, fechaInicio) => {
-  // Crear el plan de cuotas
-  const plan = await prisma.installmentPlan.create({
+  // Misma regla que POST /plans: un solo plan vigente por cliente (con lock).
+  const { lockClient, buscarPlanVigente } = require('../helpers/lockHelper');
+  const plan = await prisma.$transaction(async (tx) => {
+    await lockClient(tx, clientId);
+    if (await buscarPlanVigente(tx, clientId)) throw new Error('ACTIVE_PLAN_EXISTS');
+    return tx.installmentPlan.create({
     data: {
       clientId,
       totalCuotas,
@@ -57,6 +70,7 @@ const createInstallmentPlan = async (clientId, totalCuotas, montoCuota, fechaIni
       cuotaObjetivoRetiro: 0,
       retiroPct: 0
     }
+    });
   });
 
   // Generar todas las cuotas automáticamente
@@ -146,6 +160,8 @@ const getInstallmentsByClientId = async (clientId) => {
 };
 
 module.exports = {
+  UMBRAL_CAIDA,
+  contarVencidasImpagas,
   createInstallmentPlan,
   getPlansByClientId,
   getInstallmentsByClientId,

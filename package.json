@@ -9,7 +9,8 @@
     "migrate": "prisma migrate dev",
     "generate": "prisma generate",
     "studio": "prisma studio",
-    "seed": "node prisma/seed.js"
+    "seed": "node prisma/seed.js",
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.js\""
   },
   "prisma": {
     "seed": "node prisma/seed.js"

@@ -1,4 +1,5 @@
 const { PrismaClient } = require('@prisma/client');
+const { rangoHoy, rangoMesActual } = require('../helpers/fechaHelper');
 const prisma = new PrismaClient();
 const { isCuotaSaldada, deudaEfectivaCuota } = require('../helpers/objetivoHelper');
 const configService = require('./configService');
@@ -167,12 +168,8 @@ const getMetricasDelDia = async () => {
   const finDia = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate(), 23, 59, 59);
 
   const pagosDia = await prisma.payment.findMany({
-    where: {
-      fecha: {
-        gte: inicioDia,
-        lte: finDia
-      }
-    }
+    // Payment.fecha es fecha calendario (medianoche UTC): rango UTC de hoy.
+    where: { fecha: rangoHoy(hoy) }
   });
 
   const totalCobrado = roundCurrency(pagosDia.reduce((sum, p) => sum + (p.montoTotal || 0), 0));
@@ -196,12 +193,8 @@ const getMetricasDelMes = async () => {
   const finMes = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0, 23, 59, 59);
 
   const pagosMes = await prisma.payment.findMany({
-    where: {
-      fecha: {
-        gte: inicioMes,
-        lte: finMes
-      }
-    }
+    // Payment.fecha es fecha calendario (medianoche UTC): rango UTC del mes actual.
+    where: { fecha: rangoMesActual(hoy) }
   });
 
   const totalCobrado = roundCurrency(pagosMes.reduce((sum, p) => sum + (p.montoTotal || 0), 0));

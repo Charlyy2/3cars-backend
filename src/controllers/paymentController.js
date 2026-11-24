@@ -2,7 +2,7 @@ const paymentService = require('../services/paymentService');
 
 const createPayment = async (req, res) => {
   try {
-    const { clientId, monto, administrativoPct, fecha } = req.body;
+    const { clientId, monto, administrativoPct, fecha, planId } = req.body;
     
     if (!clientId || !monto) {
       return res.status(400).json({ 
@@ -18,13 +18,23 @@ const createPayment = async (req, res) => {
     
     const adminPct = administrativoPct !== undefined ? Number(administrativoPct) : undefined;
     
-    const result = await paymentService.createPayment(clientId, monto, adminPct, fecha);
+    // planId (opcional): imputar SOLO a ese plan. Obligatorio para cobrar un plan CAIDO.
+    const result = await paymentService.createPayment(clientId, monto, adminPct, fecha, { planId });
     res.status(201).json(result);
   } catch (error) {
     console.error('Error al procesar pago:', error);
     
     if (error.message === 'Cliente no encontrado') {
       return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    if (error.message === 'FECHA_INVALIDA') {
+      return res.status(400).json({ error: 'La fecha del pago es inválida (formato AAAA-MM-DD)', code: 'FECHA_INVALIDA' });
+    }
+    if (error.message === 'PLAN_DESTINO_INVALIDO') {
+      return res.status(400).json({ error: 'El plan indicado no existe o no pertenece al cliente', code: 'PLAN_DESTINO_INVALIDO' });
+    }
+    if (error.message === 'PLAN_NO_ADMITE_PAGOS') {
+      return res.status(409).json({ error: 'El plan indicado no admite pagos en su estado actual', code: 'PLAN_NO_ADMITE_PAGOS' });
     }
     if (error.message === 'SIN_CUOTAS_EXIGIBLES') {
       return res.status(409).json({ error: 'El cliente no tiene cuotas exigibles. Si el plan fue resuelto, registrá el pago como saldo.' });
@@ -119,6 +129,9 @@ const createSaldoPayment = async (req, res) => {
   } catch (error) {
     if (error.message === 'Cliente no encontrado') {
       return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    if (error.message === 'FECHA_INVALIDA') {
+      return res.status(400).json({ error: 'La fecha del pago es inválida (formato AAAA-MM-DD)', code: 'FECHA_INVALIDA' });
     }
     if (error.message === 'SALDO_SIN_CUOTAS_PENDIENTES') {
       return res.status(409).json({ error: 'El cliente no tiene cuotas de saldo pendientes' });

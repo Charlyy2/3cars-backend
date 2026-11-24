@@ -2,8 +2,9 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const configService = require('./configService');
 const cashMovementService = require('./cashMovementService');
-const { lockPlan } = require('../helpers/lockHelper');
+const { lockPlan, lockClient, buscarPlanVigente } = require('../helpers/lockHelper');
 const { evaluarObjetivo, isCuotaSaldada, deudaEfectivaCuota } = require('../helpers/objetivoHelper');
+const { fechaPago } = require('../helpers/fechaHelper');
 
 /**
  * Crear plan de pago sin vehículo
@@ -35,18 +36,6 @@ const createPlan = async ({
     throw new Error('CLIENT_NOT_FOUND');
   }
 
-  // Validar que no tenga plan activo
-  const activePlan = await prisma.installmentPlan.findFirst({
-    where: {
-      clientId: parsedClientId,
-      estado: 'ACTIVO',
-    },
-  });
-
-  if (activePlan) {
-    throw new Error('ACTIVE_PLAN_EXISTS');
-  }
-
   // Validar numeroSolicitud único si se proporciona
   if (numeroSolicitud) {
     const existingPlan = await prisma.installmentPlan.findUnique({
@@ -59,6 +48,14 @@ const createPlan = async ({
   }
 
   return prisma.$transaction(async (tx) => {
+    // Regla "un solo plan vigente (ACTIVO / NEGOCIACION) por cliente", verificada
+    // DENTRO de la transacción con el lock del cliente: serializa con otra creación
+    // o una reactivación simultánea del mismo cliente.
+    await lockClient(tx, parsedClientId);
+    if (await buscarPlanVigente(tx, parsedClientId)) {
+      throw new Error('ACTIVE_PLAN_EXISTS');
+    }
+
     // Crear plan
     const plan = await tx.installmentPlan.create({
       data: {
@@ -129,7 +126,7 @@ const createPlan = async ({
           montoTotal: firstInstallment.total,
           montoAplicado: firstInstallment.total,
           montoAdmin: 0,
-          fecha: new Date(),
+          fecha: fechaPago(), // fecha calendario de hoy (misma convención que el resto de los pagos)
         },
       });
 
@@ -366,7 +363,13 @@ const getPlanById = async (planId) => {
 /**
  * Obtener plan por cliente
  */
-const getPlanByClientId = async (clientId) => {
+/**
+ * Plan "vigente" de un cliente (ACTIVO / NEGOCIACION / RESUELTO). Con
+ * { incluirCaido: true } y sin plan vigente, devuelve el CAIDO más reciente
+ * (lo usa solo el detalle del cliente). Por defecto el comportamiento es el de
+ * siempre: un cliente con el plan caído no tiene plan.
+ */
+const getPlanByClientId = async (clientId, { incluirCaido = false } = {}) => {
   const includeShape = PLAN_DETAIL_INCLUDE;
 
   let plan = await prisma.installmentPlan.findFirst({
@@ -377,6 +380,16 @@ const getPlanByClientId = async (clientId) => {
     include: includeShape,
     orderBy: { fechaInicio: 'desc' },
   });
+
+  // Sin plan vigente y pedido explícito: el plan CAIDO más reciente (para verlo,
+  // cobrarle, modificar sus cuotas o reactivarlo). Un plan vigente tiene prioridad.
+  if (!plan && incluirCaido) {
+    plan = await prisma.installmentPlan.findFirst({
+      where: { clientId: parseInt(clientId), estado: 'CAIDO' },
+      include: includeShape,
+      orderBy: [{ fechaInicio: 'desc' }, { id: 'desc' }],
+    });
+  }
 
   // "Pago abierto": generar (lazy) las cuotas mensuales que hayan vencido y recargar.
   if (plan && plan.pagoAbierto && plan.estado === 'ACTIVO') {
@@ -789,7 +802,8 @@ const getSaldoByClientId = async (clientId) => {
 /**
  * Cancelar plan (dar de baja)
  */
-const cancelPlan = async (planId) => {
+// motivoCaida: BAJA_MANUAL (botón "dar de baja") | MORA_AUTOMATICA (verificación de mora).
+const cancelPlan = async (planId, { motivoCaida = 'BAJA_MANUAL' } = {}) => {
   const parsedPlanId = parseInt(planId);
 
   const plan = await prisma.installmentPlan.findUnique({
@@ -813,6 +827,7 @@ const cancelPlan = async (planId) => {
       where: { id: parsedPlanId },
       data: {
         estado: 'CAIDO',
+        motivoCaida,
       },
     });
 
@@ -895,7 +910,7 @@ const checkAndCancelOverduePlans = async () => {
   const cancelledPlans = [];
   for (const planId of plansToCancel) {
     try {
-      const cancelled = await cancelPlan(planId);
+      const cancelled = await cancelPlan(planId, { motivoCaida: 'MORA_AUTOMATICA' });
       cancelledPlans.push(cancelled);
     } catch (error) {
       console.error(`Error al cancelar plan ${planId}:`, error);
@@ -1039,11 +1054,53 @@ const getHistorial = async (planId) => {
     include: {
       ajustes: { include: { installment: { select: { numero: true } } } },
       entregasCapital: true,
+      modificacionesCuota: true,
+      reactivaciones: true,
     },
   });
   if (!plan) throw new Error('PLAN_NOT_FOUND');
 
   const eventos = [];
+
+  // Reactivaciones explícitas de un plan CAÍDO (cambio de estado, sin impacto en Caja).
+  for (const r of plan.reactivaciones) {
+    eventos.push({
+      tipo: 'REACTIVACION',
+      fecha: r.createdAt,
+      usuario: r.createdBy,
+      reactivacionId: r.id,
+      motivo: r.motivo,
+      motivoCaidaAnterior: r.motivoCaidaAnterior,
+      origenConfirmado: r.origenConfirmado,
+      cuotasVencidasImpagas: r.cuotasVencidasImpagas,
+      deudaVencida: r.deudaVencida,
+      impactoCaja: 0,
+    });
+  }
+
+  // Modificaciones del valor de cuota: no son pagos ni ajustes (sin impacto en Caja).
+  for (const m of plan.modificacionesCuota) {
+    const detalle = Array.isArray(m.detalle) ? m.detalle : [];
+    const anteriores = detalle.map((d) => Number(d.montoAnterior));
+    eventos.push({
+      tipo: 'MODIFICACION_CUOTA',
+      fecha: m.createdAt,
+      usuario: m.createdBy,
+      modificacionId: m.id,
+      montoAnteriorPlan: m.montoAnteriorPlan,
+      // Rango real de las cuotas modificadas (pueden diferir del valor del plan).
+      montoAnteriorMin: anteriores.length ? Math.min(...anteriores) : m.montoAnteriorPlan,
+      montoAnteriorMax: anteriores.length ? Math.max(...anteriores) : m.montoAnteriorPlan,
+      montoNuevo: m.montoNuevo,
+      cuotasAfectadas: m.cuotasAfectadas,
+      cuotas: detalle.map((d) => ({ numero: d.numero, montoAnterior: d.montoAnterior, montoNuevo: d.montoNuevo })),
+      deudaAnterior: m.deudaAnterior,
+      deudaNueva: m.deudaNueva,
+      variacionDeuda: m.variacionDeuda,
+      motivo: m.motivo,
+      impactoCaja: 0,
+    });
+  }
 
   for (const a of plan.ajustes) {
     eventos.push({

@@ -1,5 +1,7 @@
 const planService = require('../services/planService');
 const ajusteObjetivoService = require('../services/ajusteObjetivoService');
+const modificacionCuotaService = require('../services/modificacionCuotaService');
+const reactivacionService = require('../services/reactivacionService');
 
 const formatMoney = (v) => `$${Number(v || 0).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
 
@@ -96,7 +98,7 @@ const createPlan = async (req, res) => {
     }
 
     if (error.message === 'ACTIVE_PLAN_EXISTS') {
-      return res.status(409).json({ error: 'El cliente ya tiene un plan activo' });
+      return res.status(409).json({ error: 'El cliente ya tiene un plan vigente (activo o en negociación)' });
     }
 
     if (error.message === 'SOLICITUD_EXISTS') {
@@ -189,7 +191,8 @@ const getPlanByClientId = async (req, res) => {
       return res.status(400).json({ error: 'clientId es requerido' });
     }
 
-    const plan = await planService.getPlanByClientId(clientId);
+    const incluirCaido = String(req.query.incluirCaido || '').toLowerCase() === 'true';
+    const plan = await planService.getPlanByClientId(clientId, { incluirCaido });
 
     if (!plan) {
       return res.status(404).json({ error: 'Plan no encontrado' });
@@ -521,6 +524,120 @@ const anularAjuste = async (req, res) => {
   }
 };
 
+// ============================================================
+// MODIFICAR VALOR DE CUOTA (no es pago, ni ajuste, ni refinanciación)
+// ============================================================
+
+const MODIFICACION_ERRORS = {
+  PLAN_NOT_FOUND: [404, 'Plan no encontrado'],
+  PLAN_NO_MODIFICABLE: [400, 'Solo se puede modificar el valor de cuota de un plan activo o caído (no en negociación, resuelto ni retirado)'],
+  VERSION_REQUERIDA: [400, 'Falta la versión de la vista previa. Calculá la vista previa antes de confirmar.'],
+  VISTA_PREVIA_DESACTUALIZADA: [409, 'Los datos del plan cambiaron desde la vista previa (pago, ajuste u otra modificación). Actualizá la vista previa y volvé a confirmar.'],
+  INVALID_MONTO: [400, 'El nuevo valor por cuota debe ser un importe mayor a 0'],
+  MOTIVO_REQUERIDO: [400, 'El motivo de la modificación es obligatorio'],
+  SIN_CUOTAS_MODIFICABLES: [409, 'El plan no tiene cuotas abiertas para modificar'],
+  SIN_CAMBIOS: [409, 'Las cuotas abiertas ya tienen ese importe'],
+  CONCURRENT_MODIFICATION: [409, 'Las cuotas cambiaron mientras se guardaba. Volvé a intentarlo.'],
+};
+
+const handleModificacionError = (res, error, fallback) => {
+  if (error.message === 'CUOTAS_INCOMPATIBLES') {
+    const inc = error.preview?.incompatibles || [];
+    return res.status(409).json({
+      error: inc.length === 1 ? `Cuota ${inc[0].numero}: ${inc[0].motivo}` : `Hay ${inc.length} cuotas que no admiten el nuevo importe`,
+      code: 'CUOTAS_INCOMPATIBLES',
+      incompatibles: inc,
+      preview: error.preview,
+    });
+  }
+  if (error.message === 'CONFIRMACION_NEGOCIACION_REQUERIDA') {
+    const efecto = error.preview?.objetivo?.efectoNegociacion;
+    return res.status(409).json({
+      error: efecto === 'HABILITA'
+        ? 'Esta modificación habilita la negociación del plan. Confirmá explícitamente ese efecto.'
+        : 'Esta modificación deja el objetivo sin cumplir y deshabilita la negociación. Confirmá explícitamente ese efecto.',
+      code: 'CONFIRMACION_NEGOCIACION_REQUERIDA',
+      preview: error.preview,
+    });
+  }
+  if (MODIFICACION_ERRORS[error.message]) {
+    const [code, msg] = MODIFICACION_ERRORS[error.message];
+    return res.status(code).json({ error: msg, code: error.message, preview: error.preview || undefined });
+  }
+  console.error(`${fallback}:`, error);
+  return res.status(500).json({ error: fallback, detail: error.message });
+};
+
+/** GET /plans/:id/modificar-cuotas/preview?nuevoMonto= — solo lectura, calculado por el backend. */
+const previewModificacionCuotas = async (req, res) => {
+  try {
+    return res.json(await modificacionCuotaService.previsualizar(req.params.id, req.query.nuevoMonto));
+  } catch (error) {
+    return handleModificacionError(res, error, 'Error al calcular la vista previa');
+  }
+};
+
+/** POST /plans/:id/modificar-cuotas — { nuevoMonto, motivo, versionVistaPrevia, aceptaCambioNegociacion }. No genera movimientos de Caja. */
+const modificarCuotas = async (req, res) => {
+  try {
+    const { nuevoMonto, motivo, aceptaCambioNegociacion, versionVistaPrevia } = req.body || {};
+    const result = await modificacionCuotaService.modificarCuotas(req.params.id, {
+      nuevoMonto, motivo, aceptaCambioNegociacion, versionVistaPrevia, user: authUser(req),
+    });
+    return res.status(201).json(result);
+  } catch (error) {
+    return handleModificacionError(res, error, 'Error al modificar el valor de cuota');
+  }
+};
+
+// ============================================================
+// REACTIVAR PLAN CAÍDO (cambio de estado explícito; no es pago ni ajuste)
+// ============================================================
+
+const REACTIVACION_ERRORS = {
+  PLAN_NOT_FOUND: [404, 'Plan no encontrado'],
+  PLAN_NO_CAIDO: [400, 'Solo se puede reactivar un plan en estado CAÍDO'],
+  MOTIVO_REQUERIDO: [400, 'El motivo de la reactivación es obligatorio'],
+  VERSION_REQUERIDA: [400, 'Falta la versión de la vista previa. Actualizá la vista previa antes de confirmar.'],
+  VISTA_PREVIA_DESACTUALIZADA: [409, 'Los datos del plan cambiaron desde la vista previa (pago, ajuste u otra modificación). Actualizá la vista previa y volvé a confirmar.'],
+  OTRO_PLAN_VIGENTE: [409, 'El cliente ya tiene otro plan vigente: no se puede reactivar este plan'],
+  REACTIVACION_NO_CUMPLE: [409, 'El plan todavía tiene 3 o más cuotas vencidas impagas'],
+  CONFIRMACION_ORIGEN_REQUERIDA: [409, 'Confirmá explícitamente la advertencia sobre el origen de la caída'],
+};
+
+const handleReactivacionError = (res, error, fallback) => {
+  if (REACTIVACION_ERRORS[error.message]) {
+    const [code, msg] = REACTIVACION_ERRORS[error.message];
+    const detalle = error.message === 'REACTIVACION_NO_CUMPLE' && error.preview?.motivoBloqueo
+      ? error.preview.motivoBloqueo : msg;
+    return res.status(code).json({ error: detalle, code: error.message, preview: error.preview || undefined });
+  }
+  console.error(`${fallback}:`, error);
+  return res.status(500).json({ error: fallback, detail: error.message });
+};
+
+/** GET /plans/:id/reactivar/preview — vencidas impagas, importe mínimo, advertencias. */
+const previewReactivacion = async (req, res) => {
+  try {
+    return res.json(await reactivacionService.previsualizar(req.params.id));
+  } catch (error) {
+    return handleReactivacionError(res, error, 'Error al calcular la reactivación');
+  }
+};
+
+/** POST /plans/:id/reactivar — { motivo, versionVistaPrevia, confirmaOrigenCaida }. */
+const reactivarPlan = async (req, res) => {
+  try {
+    const { motivo, versionVistaPrevia, confirmaOrigenCaida } = req.body || {};
+    const result = await reactivacionService.reactivarPlan(req.params.id, {
+      motivo, versionVistaPrevia, confirmaOrigenCaida, user: authUser(req),
+    });
+    return res.status(201).json(result);
+  } catch (error) {
+    return handleReactivacionError(res, error, 'Error al reactivar el plan');
+  }
+};
+
 /** GET /plans/:id/historial */
 const getHistorial = async (req, res) => {
   try {
@@ -550,5 +667,9 @@ module.exports = {
   listarAjustes,
   crearAjuste,
   anularAjuste,
+  previewModificacionCuotas,
+  modificarCuotas,
+  previewReactivacion,
+  reactivarPlan,
   getHistorial,
 };

@@ -53,6 +53,12 @@ model InstallmentPlan {
   estado              String        @default("ACTIVO")
   observaciones       String?       @db.Text
 
+  // Origen de la última caída (estado CAIDO). Se registra desde la migración
+  // 20261124000000; los planes caídos antes quedan en null (origen desconocido).
+  //   MORA_AUTOMATICA - 3+ cuotas vencidas impagas (regla automática)
+  //   BAJA_MANUAL     - "dar de baja" desde el backoffice
+  motivoCaida         String?
+
   // "Pago abierto": al alcanzar la cuota objetivo el operador puede elegir que el
   // cliente siga pagando en vez de negociar. Con esto en true, el plan suma una
   // cuota nueva por cada mes que pasa (mismo monto base, sin cargos), hasta que
@@ -100,6 +106,8 @@ model InstallmentPlan {
   financing           Financing?
   ajustes             PlanAjuste[]
   entregasCapital     EntregaCapital[]
+  modificacionesCuota PlanModificacionCuota[]
+  reactivaciones      PlanReactivacion[]
 
   @@map("installment_plans")
 }
@@ -387,6 +395,71 @@ model PlanAjuste {
   @@index([planId])
   @@index([installmentId])
   @@map("plan_ajustes")
+}
+
+// ============================================================
+// MODIFICACIÓN DEL VALOR DE CUOTA (historial / auditoría)
+// ============================================================
+// Cambia el importe BASE (Installment.monto) de las cuotas abiertas del plan y
+// el valor para cuotas futuras (InstallmentPlan.montoCuotaBase). NO es un pago,
+// ni un ajuste/condonación, ni una refinanciación: no genera Payment,
+// PaymentAllocation, PlanAjuste ni CashMovement. Inmutable: nunca se edita ni
+// se borra; cada modificación es un evento nuevo del historial.
+model PlanModificacionCuota {
+  id                 Int       @id @default(autoincrement())
+  planId             Int
+  clientId           Int
+  montoAnteriorPlan  Float     // InstallmentPlan.montoCuotaBase antes del cambio
+  montoNuevo         Float     // nuevo importe base solicitado
+  cuotasAfectadas    Int
+  deudaAnterior      Float     // deuda pendiente del plan antes (Σ total - pagado - ajustado)
+  deudaNueva         Float     // deuda pendiente del plan después
+  variacionDeuda     Float     // deudaNueva - deudaAnterior (negativo = reducción)
+  motivo             String    @db.Text
+  // [{ installmentId, numero, estadoAnterior, estadoNuevo, montoAnterior, montoNuevo,
+  //    totalAnterior, totalNuevo, pagado, ajustado, pendienteAnterior, pendienteNuevo }]
+  detalle            Json
+  // Snapshot del objetivo antes/después (objetivoOriginal, saldoPendienteEfectivo, puedeNegociar)
+  objetivo           Json?
+  // Versión (hash de los datos + importe) de la vista previa que el operador aceptó.
+  versionVistaPrevia String?
+
+  createdById        Int?
+  createdBy          String?
+  createdAt          DateTime  @default(now())
+
+  plan               InstallmentPlan @relation(fields: [planId], references: [id])
+
+  @@index([planId])
+  @@map("plan_modificaciones_cuota")
+}
+
+// ============================================================
+// REACTIVACIÓN DE PLANES CAÍDOS (auditoría)
+// ============================================================
+// Cambio de estado EXPLÍCITO CAIDO → ACTIVO. No es un pago ni un ajuste: no
+// crea Payment, PaymentAllocation, PlanAjuste ni CashMovement, no cambia
+// vencimientos ni condona deuda. Solo se permite si quedan menos de 3 cuotas
+// vencidas impagas (misma regla que la caída automática). Inmutable.
+model PlanReactivacion {
+  id                    Int       @id @default(autoincrement())
+  planId                Int
+  clientId              Int
+  motivo                String    @db.Text
+  motivoCaidaAnterior   String?   // MORA_AUTOMATICA | BAJA_MANUAL | null (desconocido)
+  origenConfirmado      Boolean   @default(false) // el operador aceptó la advertencia de origen
+  cuotasVencidasImpagas Int       // al momento de reactivar (< 3)
+  deudaVencida          Float     // deuda efectiva de esas cuotas
+  versionVistaPrevia    String?
+
+  createdById           Int?
+  createdBy             String?
+  createdAt             DateTime  @default(now())
+
+  plan                  InstallmentPlan @relation(fields: [planId], references: [id])
+
+  @@index([planId])
+  @@map("plan_reactivaciones")
 }
 
 // ============================================================

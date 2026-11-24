@@ -25,6 +25,9 @@ const createInstallmentPlan = async (req, res) => {
     
     res.status(201).json(result);
   } catch (error) {
+    if (error.message === 'ACTIVE_PLAN_EXISTS') {
+      return res.status(409).json({ error: 'El cliente ya tiene un plan vigente (activo o en negociación)' });
+    }
     console.error('Error al crear plan de cuotas:', error);
     res.status(500).json({ error: 'Error al crear plan de cuotas' });
   }
